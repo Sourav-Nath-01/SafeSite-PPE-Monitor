@@ -1,0 +1,54 @@
+# ---------------------------------------------------------------------------
+# Large artifacts kept out of version control. Everything here is either
+# re-downloadable or regenerable; see README "Getting the dataset & weights".
+# ---------------------------------------------------------------------------
+
+# Dataset (166 MB) - fetch from Roboflow, see README
+Model-Training/Dataset/
+
+# Demo videos and stock imagery used for manual testing (26 MB)
+Model-Training/source_files/
+
+# Stock COCO checkpoints - Ultralytics downloads these on first use
+Model-Training/yolov8s.pt
+Model-Training/yolo11n.pt
+Model-Training/yolov8n.pt
+Model-Deployment/yolov8n.pt
+
+# Superseded 80-epoch run; the 200-epoch run is the one reported in the README
+Model-Training/Outputs/runs/detect/yolov8s_ppe_css_80_epochs/
+
+# Regenerable exports and redundant checkpoints
+# (best.pt IS tracked - it is the deliverable)
+Model-Training/Outputs/runs/detect/*/weights/last.pt
+Model-Training/Outputs/runs/detect/*/weights/*.onnx
+Model-Training/Outputs/runs/detect/*/weights/*.engine
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---------------------------------------------------------------------------
+# Runtime state produced by the monitoring service
+# ---------------------------------------------------------------------------
+Model-Deployment/snapshots/
+Model-Deployment/*.db
+Model-Deployment/settings.json
+Model-Deployment/instance_counter.json
+
+# Generated evaluation artifacts
+Model-Training/Outputs/data.resolved.yaml
+metrics_*.md
+latency.md
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store

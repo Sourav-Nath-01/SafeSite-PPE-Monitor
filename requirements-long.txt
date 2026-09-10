@@ -1,0 +1,9 @@
+# PyTorch must match your CUDA toolkit. The build below targets CUDA 12.8
+# (RTX 50-series); pick the matching wheel from https://pytorch.org for others.
+python -m pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+
+# Everything else
+python -m pip install -r requirements.txt
+
+# Training/analysis extras used by the notebook
+python -m pip install matplotlib pandas seaborn tqdm jupyter

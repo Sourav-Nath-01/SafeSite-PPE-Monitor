@@ -1,0 +1,11 @@
+Model-Training/Dataset/
+Model-Training/source_files/
+Model-Training/Outputs/runs/detect/*/train_batch*.jpg
+Model-Training/Outputs/runs/detect/*/val_batch*.jpg
+Model-Training/Outputs/runs/detect/yolov8s_ppe_css_80_epochs/
+Model-Deployment/snapshots/
+Model-Deployment/*.db
+assets/
+.git/
+__pycache__/
+*.pyc

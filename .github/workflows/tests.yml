@@ -1,0 +1,21 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # The compliance logic imports no torch, OpenCV or numpy by design, so the
+      # suite runs on a bare interpreter in seconds - no weights, GPU or camera.
+      - name: Run compliance test suite
+        run: ./run_tests.sh

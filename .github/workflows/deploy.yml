@@ -1,0 +1,105 @@
+name: deploy
+
+# Continuous deployment to Azure Container Apps.
+# Runs after the "tests" workflow succeeds on main, or by hand. Until
+# infra/bootstrap.sh has set the AZURE_* repository variables it skips cleanly.
+
+on:
+  workflow_run:
+    workflows: [tests]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # OIDC token for azure/login - no Azure password is stored in GitHub
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      vars.AZURE_CLIENT_ID != '' &&
+      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    # The OIDC federated credential trusts only this environment.
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.url }}
+    env:
+      NAME: ${{ vars.AZURE_APP_NAME }}
+      RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      REGISTRY: ${{ vars.AZURE_REGISTRY }}
+      TAG: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to the container registry
+        run: az acr login --name "$REGISTRY"
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Built on the runner rather than with `az acr build`, which some
+      # subscription types (free trial, Azure for Students) do not allow.
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.REGISTRY }}.azurecr.io/safesite:${{ env.TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The whole template is applied on every deploy, so the infrastructure
+      # cannot drift from what is in the repository. assignRoles=false because
+      # this identity is Contributor and cannot write role assignments; the
+      # bootstrap run already created them.
+      - name: Deploy Container App
+        id: deploy
+        env:
+          ADMIN_PASSWORD: ${{ secrets.PPE_ADMIN_PASSWORD }}
+          MIN_REPLICAS: ${{ vars.AZURE_MIN_REPLICAS || '0' }}
+          CPU: ${{ vars.AZURE_CPU || '1.0' }}
+        run: |
+          url=$(az deployment group create \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "deploy-${GITHUB_RUN_ID}" \
+            --template-file infra/main.bicep \
+            --parameters name="$NAME" imageTag="$TAG" assignRoles=false \
+                         githubRepo="$GITHUB_REPOSITORY" minReplicas="$MIN_REPLICAS" cpu="$CPU" \
+                         adminPassword="$ADMIN_PASSWORD" \
+            --query properties.outputs.appUrl.value --output tsv)
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      # With minReplicas=0 the first request also pays for a cold start.
+      - name: Smoke test
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          for attempt in $(seq 1 30); do
+            if body=$(curl -fsS --max-time 20 "$URL/healthz"); then
+              echo "Healthy: $body"
+              echo "### Deployed :rocket:" >> "$GITHUB_STEP_SUMMARY"
+              echo "$URL ($TAG)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Waiting for $URL/healthz (attempt $attempt)"
+            sleep 10
+          done
+          echo "::error::$URL/healthz never became healthy"
+          az config set extension.use_dynamic_install=yes_without_prompt --only-show-errors
+          az containerapp logs show --resource-group "$RESOURCE_GROUP" --name "ca-$NAME" --tail 100 || true
+          exit 1

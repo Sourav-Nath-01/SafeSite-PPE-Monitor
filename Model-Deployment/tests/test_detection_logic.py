@@ -257,5 +257,72 @@ class TestSettings(ClockTest):
         self.assertEqual(names, [f"{instance_id}_snapshot_{i}" for i in (1, 2, 3)])
 
 
+class TestSharedSerialCounter(ClockTest):
+    """Several video sources (browser sessions) write into one instances table."""
+
+    def confirm_violation(self, detector, track_id):
+        detector.process_detection(worker(track_id, helmet=False), settings=SETTINGS)
+        self.tick(3.0)
+        result = detector.process_detection(worker(track_id, helmet=False), settings=SETTINGS)
+        return result['violations'][0]['instance_id']
+
+    def test_detectors_sharing_a_counter_never_reuse_an_instance_id(self):
+        counter = detection_logic.SerialCounter('shared_counter.json')
+        first = InstanceDetector(counter=counter)
+        second = InstanceDetector(counter=counter)
+
+        # Both sessions see "worker 1" -- ByteTrack IDs are per tracker, so they collide.
+        ids = {self.confirm_violation(first, 1), self.confirm_violation(second, 1)}
+
+        self.assertEqual(len(ids), 2)
+
+    def test_counter_survives_a_restart(self):
+        first_id = detection_logic.SerialCounter('restart_counter.json').next_id()
+        after_restart = detection_logic.SerialCounter('restart_counter.json').next_id()
+
+        self.assertNotEqual(first_id, after_restart)
+        self.assertTrue(after_restart.endswith('_2'))
+
+
+class TestEvaluateStill(unittest.TestCase):
+    """Single uploaded images: association without tracking or debounce."""
+
+    REQUIRED = {'helmet': True, 'vest': True, 'mask': False}
+
+    def test_violation_is_reported_immediately(self):
+        result = detection_logic.evaluate_still(worker(None, helmet=False), self.REQUIRED)
+
+        self.assertFalse(result['is_compliant'])
+        self.assertEqual(result['violation_count'], 1)
+        self.assertEqual(result['missing_ppe'], ['helmet'])
+        self.assertTrue(result['persons'][0]['violation_confirmed'])
+
+    def test_compliant_image_has_no_violations(self):
+        result = detection_logic.evaluate_still(worker(None), self.REQUIRED)
+
+        self.assertTrue(result['is_compliant'])
+        self.assertEqual(result['violations'], [])
+
+    def test_no_instance_id_is_drawn_for_a_still(self):
+        result = detection_logic.evaluate_still(worker(None, helmet=False), self.REQUIRED)
+
+        self.assertIsNone(result['instance_id'])
+        self.assertIsNone(result['violations'][0]['instance_id'])
+
+    def test_unworn_helmet_still_does_not_confer_compliance(self):
+        frame = worker(None, helmet=False) + [det('Hardhat', [600, 500, 650, 540])]
+
+        result = detection_logic.evaluate_still(frame, self.REQUIRED)
+
+        self.assertFalse(result['is_compliant'])
+        self.assertEqual(len(result['unassigned_ppe']), 1)
+
+    def test_empty_image(self):
+        result = detection_logic.evaluate_still([], self.REQUIRED)
+
+        self.assertFalse(result['has_person'])
+        self.assertTrue(result['is_compliant'])
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

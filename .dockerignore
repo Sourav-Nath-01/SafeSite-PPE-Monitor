@@ -1,11 +1,17 @@
-Model-Training/Dataset/
-Model-Training/source_files/
-Model-Training/Outputs/runs/detect/*/train_batch*.jpg
-Model-Training/Outputs/runs/detect/*/val_batch*.jpg
-Model-Training/Outputs/runs/detect/yolov8s_ppe_css_80_epochs/
+# Allow-list: the image needs the service code, the dependency list and one
+# checkpoint. Everything else (dataset, videos, other runs, exports, .git)
+# stays out, which keeps the build context - uploaded on every CI build - small.
+*
+!requirements.txt
+!Model-Deployment/
+!Model-Training/Outputs/runs/detect/yolov8s_ppe_css_200_epochs/weights/best.pt
+
+# Runtime state and tests from a local run must not be baked into the image.
+Model-Deployment/tests/
 Model-Deployment/snapshots/
 Model-Deployment/*.db
-assets/
-.git/
-__pycache__/
-*.pyc
+Model-Deployment/*.db-*
+Model-Deployment/settings.json
+Model-Deployment/instance_counter.json
+**/__pycache__/
+**/*.pyc

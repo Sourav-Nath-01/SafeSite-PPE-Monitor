@@ -3,7 +3,7 @@
 The training run reports validation metrics, which the model selection was
 tuned against. The number worth quoting is the one from the 82-image test split
 that nothing was chosen on -- and the per-class table, because an aggregate
-mAP of 0.88 can hide a class that barely works.
+mAP@50 of 0.82 hides a NO-Hardhat recall of 0.64.
 
 Usage:
     python evaluate.py

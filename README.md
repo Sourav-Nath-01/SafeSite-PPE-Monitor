@@ -300,20 +300,30 @@ compliance monitor with a reviewable violation log.
   crashed stream)
 - **`gunicorn.conf.py`** - one worker, threaded: session state is in-process
 
-- **`database.py`** - SQLite persistence
-  - Tables: `instances`, `snapshots`, `alerts`; rows read by column name
-  - `_migrate()`: adds `track_id` and `owner` columns in place on existing databases
+- **`database.py`** - persistence on SQLite (local) or PostgreSQL (Azure)
+  - One set of queries for both backends; a thin cursor wrapper handles
+    placeholders, and rows are read by column name
+  - PostgreSQL through a connection pool whose connections sign in with a
+    Microsoft Entra token for the app's managed identity: no password exists
+  - Tables: `instances`, `snapshots`, `alerts`; `_migrate()` upgrades old
+    SQLite files in place
   - Sort parameters are whitelisted (they are interpolated into `ORDER BY`)
-  - `purge_older_than()`: retention for the public demo
+  - `purge_older_than()`: retention; `max_serial()`: lets a restarted container
+    resume instance IDs above the stored ones instead of overwriting them
+- **`storage.py`** - snapshot images in a local folder or a private Azure Blob
+  container, behind the same save / load / delete interface
 
-- **`tests/`** - 72 unit tests, no model or GPU required
+- **`tests/`** - 110 tests, no model or GPU required (85 run anywhere; 25 more
+  run in CI against real PostgreSQL and the Azurite Blob emulator)
   - `test_ppe_association.py` (23): geometry, class mapping, region priors,
     adjacent-worker assignment, the helmet-on-the-ground regression
   - `test_detection_logic.py` (24): debounce, per-track independence, track
     eviction, instance-ID uniqueness across sessions, compliance modes,
     single-image evaluation
-  - `test_database.py` (14): migration, sort whitelist, snapshot counts, visitor
-    isolation, retention
+  - `test_database.py` (37): every case on SQLite *and* PostgreSQL - sort
+    whitelist, snapshot counts, visitor isolation, retention, serial recovery,
+    plus the SQLite migration
+  - `test_storage.py` (15): local and Blob stores, including path stripping
   - `test_settings_schema.py` (11): validation and settings-file recovery
   - Time is injected by monkey-patching `time.time`, so the temporal tests are
     deterministic rather than sleep-based
@@ -353,9 +363,9 @@ Repository documentation assets:
 ### **Root Files**
 - **`requirements.txt`**: Runtime dependencies
 - **`requirements-long.txt`**: Install order, including the CUDA-matched PyTorch wheel
-- **`run_tests.sh`**: Runs the 72-test suite (no model or GPU needed)
+- **`run_tests.sh`**: Runs the test suite (no model or GPU needed)
 - **`Dockerfile`** / **`.dockerignore`**: CPU container (non-root, gunicorn, health check)
-- **`infra/`**: Bicep template and one-time bootstrap script for Azure
+- **`infra/`**: Bicep templates and the one-time bootstrap script for Azure
 - **`.github/workflows/`**: tests + Bicep compile on every push; deploy to Azure after tests pass
 - **`README.md`**: Project documentation and usage guide
 - **`LICENSE`**: Project licensing information
@@ -382,13 +392,15 @@ Construction-Site-Safety-PPE-Detection/
 │   ├── visualization.py       # compliance overlay + HUD
 │   ├── app.py                 # Flask + Socket.IO service
 │   ├── settings_schema.py     # settings validation & persistence
-│   ├── database.py            # SQLite persistence & migrations
+│   ├── database.py            # SQLite / PostgreSQL persistence
+│   ├── storage.py             # snapshot images: local folder / Azure Blob
 │   ├── gunicorn.conf.py       # production server config
 │   ├── templates/{index,review,settings}.html
 │   └── tests/
 │       ├── test_ppe_association.py
 │       ├── test_detection_logic.py
 │       ├── test_database.py
+│       ├── test_storage.py
 │       └── test_settings_schema.py
 │
 ├── Model-Testing/
@@ -397,7 +409,8 @@ Construction-Site-Safety-PPE-Detection/
 │   ├── checker.py, test_cam.py, test_single.py
 │
 ├── infra/
-│   ├── main.bicep             # Container Apps, ACR, Log Analytics, identities
+│   ├── main.bicep             # Container Apps, ACR, PostgreSQL, Blob, identities
+│   ├── modules/postgres-admin.bicep
 │   └── bootstrap.sh           # one-time setup, run in Azure Cloud Shell
 ├── .github/workflows/
 │   ├── tests.yml              # unit tests + Bicep build
@@ -535,6 +548,10 @@ All optional; the defaults reproduce a local, single-user install.
 | `PPE_RETENTION_HOURS` | `0` (keep) | Purge violations older than this |
 | `PPE_MODEL_PATH` | 200-epoch `best.pt` | Override the weights |
 | `PPE_SECURE_COOKIES` | `false` | Set `true` behind HTTPS |
+| `PPE_DATABASE_URL` | _(unset: SQLite)_ | PostgreSQL conninfo or URL |
+| `PPE_DB_AUTH` | _(unset)_ | `entra`: sign in to PostgreSQL with a managed-identity token |
+| `PPE_BLOB_ACCOUNT_URL` | _(unset: local folder)_ | Store snapshots in Azure Blob Storage |
+| `PPE_BLOB_CONTAINER` | `snapshots` | Blob container name |
 
 ### Run in Docker
 
@@ -556,26 +573,42 @@ with `--gpus all`.
 ./run_tests.sh
 ```
 
-72 tests covering association geometry, the temporal state machine, the
-database layer and settings validation. They import no torch, OpenCV or numpy
-and need no weights, so they run in well under a second in CI.
+110 tests covering association geometry, the temporal state machine, the
+database and storage layers and settings validation. They import no torch,
+OpenCV or numpy and need no weights, so they run in about a second. CI also
+runs the database cases against PostgreSQL 16 and the storage cases against
+the Azurite Blob emulator; locally, point `PPE_TEST_DATABASE_URL` and
+`PPE_TEST_AZURITE_BLOB_URL` at your own instances to do the same.
 
 ## Deploying to Azure
 
 ```
- GitHub push ─► tests (unit + Bicep build) ─► deploy workflow
+ GitHub push ─► tests (unit, PostgreSQL, Azurite, Bicep, container) ─► deploy workflow
                                                 │ OIDC login (no stored secret)
                                                 │ docker build ─► Azure Container Registry
                                                 ▼
                          Azure Container Apps  (HTTPS ingress, WebSockets, scale 0-1)
                          └─ container: gunicorn + Flask-SocketIO + YOLOv8s (CPU)
                               │ pulls image with a managed identity (AcrPull)
+                              │ app identity (Entra tokens, no passwords or keys):
+                              ├─► Azure Database for PostgreSQL  - violation records
+                              ├─► Azure Blob Storage (private)   - snapshot images
                               └─ logs ─► Log Analytics
 ```
 
 Everything is defined in [`infra/main.bicep`](infra/main.bicep). Container Apps
 fits this workload: it supports WebSockets, terminates TLS (needed for browser
 camera access), and scales to zero, so an idle demo costs almost nothing.
+Because records and images live in managed services, the container itself is
+stateless: restarts, redeploys and scale-to-zero lose nothing.
+
+**Passwordless by design.** PostgreSQL runs with password sign-in disabled;
+the app's managed identity is its Microsoft Entra administrator and each pooled
+connection presents a fresh token. The storage account has shared-key access
+disabled, so only identities with an RBAC role can read the private snapshot
+container -- images reach browsers only through the app, which checks
+ownership first. A lifecycle rule deletes snapshots after the retention period
+even if the app is not running.
 
 **One-time setup** (about 5 minutes; Azure Cloud Shell has every tool needed):
 
@@ -585,21 +618,28 @@ git clone https://github.com/<you>/<repo>.git && cd <repo>
 ```
 
 This creates the resource group, container registry, Container Apps
-environment, Log Analytics workspace and two managed identities (one to pull
-images, one federated with GitHub for deploys), then sets the `AZURE_*`
-repository variables (or prints them for you to add).
+environment, Log Analytics workspace, PostgreSQL server and storage account,
+and three managed identities (image pulls, the app's data access, and GitHub
+deploys via OIDC), then sets the `AZURE_*` repository variables (or prints them
+for you to add). PostgreSQL takes 5-10 minutes to create. If your subscription
+restricts regions, pass an allowed one: `LOCATION=uaenorth ./infra/bootstrap.sh ...`
+(`DATABASE_LOCATION=...` if PostgreSQL alone needs a different region).
 
 **Deploy:** push to `main`, or run `gh workflow run deploy.yml`. The workflow
 builds the image, pushes it, re-applies the Bicep template with the new tag,
 smoke-tests `/healthz` and puts the URL in the run summary.
 
 Optional repository settings: secret `PPE_ADMIN_PASSWORD`; variables
-`AZURE_MIN_REPLICAS` (`1` keeps the demo warm, no cold start) and `AZURE_CPU`
-(`0.5`-`2.0`).
+`AZURE_MIN_REPLICAS` (`1` keeps the demo warm, no cold start), `AZURE_CPU`
+(`0.5`-`2.0`) and `AZURE_PERSISTENCE` (`false` falls back to the container's
+temporary disk).
 
 **Cost (rough estimate - check the Azure pricing calculator for your region):**
 with `minReplicas=0` the app mostly falls inside the Container Apps monthly free
-grant, leaving the Basic registry (about US$5/month) as the main cost. Keeping
+grant, leaving the Basic registry (about US$5/month) as the main cost. The
+PostgreSQL server is a Burstable B1ms with 32 GB, the size covered by the
+12-month free tier for new Azure accounts (including Azure for Students);
+afterwards it is roughly US$15/month. Blob storage for snapshots costs cents. Keeping
 one replica warm (`AZURE_MIN_REPLICAS=1`, 1 vCPU / 2 GiB) adds idle-rate compute,
 on the order of US$20-25/month. `az group delete -n rg-safesite` removes
 everything.
@@ -665,10 +705,11 @@ Stated plainly, because they bound what the system can honestly claim:
   memory, so the deployment is pinned to one replica (a few concurrent visitors
   on CPU). Scaling out would need sticky sessions plus a message queue, or
   inference moved to a separate worker pool.
-- **Ephemeral storage in the cloud.** The SQLite log and snapshots live in the
-  container's filesystem; a restart or scale-to-zero clears them. That suits a
-  public demo (and its privacy); a production deployment would move to Azure
-  Database for PostgreSQL and Blob Storage.
+- **Settings are per container.** Violation records and images persist in
+  PostgreSQL and Blob Storage, but admin settings and the session-signing key
+  do not: a redeploy resets settings to defaults and signs visitors out (their
+  earlier violations then age out under retention). Moving settings into the
+  database and the key into Key Vault would close this.
 - **CPU inference.** Roughly 300 ms per frame for YOLOv8s on one vCPU, i.e. a
   few FPS per visitor. An ONNX Runtime image or a GPU workload profile would
   raise it.
@@ -699,6 +740,6 @@ by Roboflow.
 Work added in this fork: the person-to-PPE association module, ByteTrack
 integration and per-track temporal state machine, the compliance visualization
 layer, browser-fed video and image inference with per-visitor sessions, the
-72-test suite, the test-split evaluation and latency benchmarking scripts, the
-SQLite migrations, containerization, and the Azure deployment (Bicep + GitHub
+110-test suite (with PostgreSQL and Azurite integration runs), the test-split evaluation and latency benchmarking scripts, the
+SQLite migrations and the PostgreSQL / Blob storage backends, containerization, and the Azure deployment (Bicep + GitHub
 Actions).

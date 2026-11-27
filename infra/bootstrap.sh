@@ -7,12 +7,16 @@
 #     ./infra/bootstrap.sh <github-owner>/<repo>
 #
 # Creates the resource group and everything except the app itself - container
-# registry, Container Apps environment, Log Analytics, managed identities - and
+# registry, Container Apps environment, Log Analytics, managed identities,
+# PostgreSQL + Blob Storage for persistent data (PERSISTENCE=false skips) - and
 # an OIDC identity that lets .github/workflows/deploy.yml deploy with no stored
 # password. Afterwards, every push to main builds and ships a new revision.
 #
 # Needs Owner (or User Access Administrator) on the subscription, because it
-# creates role assignments. Optional overrides: NAME, RESOURCE_GROUP, LOCATION.
+# creates role assignments. Safe to re-run: it updates what exists.
+#
+# Optional overrides: NAME, RESOURCE_GROUP, LOCATION, PERSISTENCE (true),
+# DATABASE_LOCATION (PostgreSQL region if LOCATION does not offer it).
 set -euo pipefail
 
 REPO="${1:-}"
@@ -24,6 +28,8 @@ fi
 NAME="${NAME:-safesite}"
 RESOURCE_GROUP="${RESOURCE_GROUP:-rg-${NAME}}"
 LOCATION="${LOCATION:-centralindia}"
+PERSISTENCE="${PERSISTENCE:-true}"
+DATABASE_LOCATION="${DATABASE_LOCATION:-}"
 DEPLOYMENT="${NAME}-bootstrap"
 
 cd "$(dirname "$0")/.."
@@ -32,7 +38,8 @@ echo "==> Signed in as:"
 az account show --query "{subscription: name, id: id, user: user.name}" --output table
 
 echo "==> Registering resource providers (first time only, may take a minute)"
-for namespace in Microsoft.App Microsoft.ContainerRegistry Microsoft.OperationalInsights Microsoft.ManagedIdentity; do
+for namespace in Microsoft.App Microsoft.ContainerRegistry Microsoft.OperationalInsights \
+                 Microsoft.ManagedIdentity Microsoft.Storage Microsoft.DBforPostgreSQL; do
   az provider register --namespace "$namespace" --wait --only-show-errors
 done
 
@@ -46,13 +53,18 @@ IDS=$(curl -fsSL "https://api.github.com/repos/${REPO}" \
   | python3 -c "import json, sys; r = json.load(sys.stdin); print(r['owner']['id'], r['id'])")
 read -r OWNER_ID REPO_ID <<<"$IDS"
 
-echo "==> Registry, environment and identities"
+if [[ "$PERSISTENCE" == "true" ]]; then
+  echo "==> Registry, environment, identities, PostgreSQL and Blob Storage (PostgreSQL takes 5-10 min)"
+else
+  echo "==> Registry, environment and identities"
+fi
 az deployment group create \
   --resource-group "$RESOURCE_GROUP" \
   --name "$DEPLOYMENT" \
   --template-file infra/main.bicep \
   --parameters name="$NAME" deployApp=false githubRepo="$REPO" \
                githubOwnerId="$OWNER_ID" githubRepoId="$REPO_ID" \
+               persistence="$PERSISTENCE" databaseLocation="$DATABASE_LOCATION" \
   --output none
 
 output() {
@@ -69,7 +81,11 @@ VARIABLES=(
   "AZURE_RESOURCE_GROUP=${RESOURCE_GROUP}"
   "AZURE_REGISTRY=$(output registryName)"
   "AZURE_APP_NAME=${NAME}"
+  "AZURE_PERSISTENCE=${PERSISTENCE}"
 )
+if [[ -n "$DATABASE_LOCATION" ]]; then
+  VARIABLES+=("AZURE_DATABASE_LOCATION=${DATABASE_LOCATION}")
+fi
 
 echo
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then

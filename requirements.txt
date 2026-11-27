@@ -16,6 +16,14 @@ simple-websocket>=1.0     # WebSocket transport for the threading async mode
 gunicorn>=22.0            # production server (see Model-Deployment/gunicorn.conf.py)
 Pillow>=10.0
 
+# Persistent storage in Azure: PostgreSQL for records, Blob Storage for
+# snapshots, both signed in with a managed identity. Unused locally (SQLite +
+# a folder), so the test suite does not need them.
+psycopg[binary]>=3.2
+psycopg-pool>=3.2
+azure-identity>=1.17
+azure-storage-blob>=12.20
+
 # Optional: ONNX Runtime inference path used by Model-Testing/benchmark.py
 # onnxruntime-gpu>=1.17   ; GPU
 # onnxruntime>=1.17       ; CPU

@@ -31,7 +31,7 @@ from datetime import datetime, timezone  # noqa: E402
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 from flask import (Flask, Response, abort, jsonify, render_template, request,  # noqa: E402
-                   send_from_directory, session)
+                   session)
 from flask_socketio import SocketIO  # noqa: E402
 from ultralytics import YOLO  # noqa: E402
 from werkzeug.middleware.proxy_fix import ProxyFix  # noqa: E402
@@ -42,6 +42,7 @@ from detection_logic import (ComplianceChecker, InstanceDetector, SerialCounter,
                              SnapshotManager, evaluate_still)
 from settings_schema import (SettingsError, load_settings, save_settings,  # noqa: E402
                              validate_settings)
+from storage import BlobSnapshotStore, LocalSnapshotStore  # noqa: E402
 
 
 # ----------------------------------------------------------------------
@@ -74,6 +75,16 @@ MAX_FRAME_BYTES = 2 * 1024 * 1024
 MAX_FRAME_SIDE = 1280           # larger inputs are downscaled before inference
 
 SETTINGS_FILE = os.path.join(DATA_DIR, 'settings.json')
+
+# Persistent storage (the Azure deployment). Unset = SQLite + local folder.
+#   PPE_DATABASE_URL      libpq conninfo or URL, e.g. "host=... dbname=... user=... sslmode=require"
+#   PPE_DB_AUTH=entra     sign in with a Microsoft Entra token (managed identity), no password
+#   PPE_BLOB_ACCOUNT_URL  e.g. https://<account>.blob.core.windows.net
+DATABASE_URL = os.environ.get('PPE_DATABASE_URL', '')
+DB_AUTH = os.environ.get('PPE_DB_AUTH', '').strip().lower()
+BLOB_ACCOUNT_URL = os.environ.get('PPE_BLOB_ACCOUNT_URL', '')
+BLOB_CONTAINER = os.environ.get('PPE_BLOB_CONTAINER', 'snapshots')
+POSTGRES_TOKEN_SCOPE = 'https://ossrdbms-aad.database.windows.net/.default'
 
 # Weights are searched best-first so the app never silently serves a weaker
 # model than the one the results in the README were measured on.
@@ -120,10 +131,41 @@ socketio = SocketIO(app, async_mode='threading',
 # Applied after SocketIO() so it wraps the Socket.IO middleware too.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-db = Database(os.path.join(DATA_DIR, 'detections.db'),
-              snapshot_dir=os.path.join(DATA_DIR, 'snapshots'))
-snapshot_manager = SnapshotManager(os.path.join(DATA_DIR, 'snapshots'))
-serial_counter = SerialCounter(os.path.join(DATA_DIR, 'instance_counter.json'))
+
+
+def build_storage():
+    """Snapshot store + database, from the environment.
+
+    In Azure both sign in as the app's managed identity (DefaultAzureCredential
+    picks it up from AZURE_CLIENT_ID): no connection-string password and no
+    storage account key exists anywhere in the deployment.
+    """
+    credential = None
+    if BLOB_ACCOUNT_URL or DB_AUTH == 'entra':
+        from azure.identity import DefaultAzureCredential
+        credential = DefaultAzureCredential()
+
+    if BLOB_ACCOUNT_URL:
+        store = BlobSnapshotStore(BLOB_ACCOUNT_URL, BLOB_CONTAINER, credential)
+    else:
+        store = LocalSnapshotStore(os.path.join(DATA_DIR, 'snapshots'))
+
+    token_provider = None
+    if DATABASE_URL and DB_AUTH == 'entra':
+        def token_provider():
+            return credential.get_token(POSTGRES_TOKEN_SCOPE).token
+
+    database = Database(os.path.join(DATA_DIR, 'detections.db'), url=DATABASE_URL or None,
+                        token_provider=token_provider, store=store)
+    database.init_db()
+    return store, database
+
+
+snapshot_store, db = build_storage()
+snapshot_manager = SnapshotManager(store=snapshot_store)
+# Floor from the database: a restarted container must not reuse stored IDs.
+serial_counter = SerialCounter(os.path.join(DATA_DIR, 'instance_counter.json'),
+                               floor=db.max_serial)
 compliance_checker = ComplianceChecker()
 
 current_settings = load_settings(SETTINGS_FILE)
@@ -401,6 +443,7 @@ def healthz():
         return jsonify(status='starting'), 503
     return jsonify(status='ok',
                    model=os.path.basename(MODEL_PATH) if MODEL_PATH else 'yolov8n.pt',
+                   storage={'database': db.dialect, 'snapshots': snapshot_store.kind},
                    browser_sessions=len(browser_sessions),
                    max_sessions=MAX_SESSIONS)
 
@@ -721,8 +764,9 @@ def get_instance_snapshots(instance_id):
 def _send_snapshot(filename, as_attachment):
     """Serve one snapshot by bare file name, never by path.
 
-    send_from_directory refuses anything that resolves outside the snapshot
-    directory, and on the public demo the file must belong to this visitor.
+    Only names recorded in the database are served (the store also strips any
+    directory part), and on the public demo the snapshot must belong to this
+    visitor. Blob storage stays private: images reach the browser only here.
     """
     name = os.path.basename(filename)
     exists, owner = db.snapshot_owner(name)
@@ -731,8 +775,15 @@ def _send_snapshot(filename, as_attachment):
     scope = owner_scope()
     if scope is not None and owner != scope:
         abort(404)
-    return send_from_directory(snapshot_manager.snapshot_dir, name,
-                               mimetype='image/jpeg', as_attachment=as_attachment)
+
+    data = snapshot_store.load(name)
+    if data is None:
+        abort(404)
+    response = Response(data, mimetype='image/jpeg')
+    response.headers['Cache-Control'] = 'private, max-age=3600'
+    if as_attachment:
+        response.headers['Content-Disposition'] = f'attachment; filename="{name}"'
+    return response
 
 
 @app.route('/snapshots/<path:filename>')
@@ -776,7 +827,6 @@ def init_service():
     """Runs at import, so it happens under gunicorn as well as `python app.py`."""
     global image_model
 
-    db.init_db()
     if MODEL_PATH:
         print(f"[app] Loading weights: {MODEL_PATH}")
     image_model = new_model()
@@ -789,6 +839,7 @@ def init_service():
         threading.Thread(target=_retention_loop, name='retention', daemon=True).start()
 
     print(f"[app] Ready - public_demo={PUBLIC_DEMO} server_camera={SERVER_CAMERA} "
+          f"database={db.dialect} snapshots={snapshot_store.kind} "
           f"data_dir={DATA_DIR} admin={'on' if ADMIN_PASSWORD else 'off'}")
 
 

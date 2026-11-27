@@ -21,6 +21,58 @@ jobs:
       - name: Run compliance test suite
         run: ./run_tests.sh
 
+  # The same suite against the backends the Azure deployment uses: every
+  # database case on PostgreSQL 16, every snapshot-store case on the Azurite
+  # Blob emulator. Fails if any of those cases were skipped.
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: safesite_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Started by hand rather than as a service so it can skip the API version
+      # check: the SDK can be newer than the emulator.
+      - name: Start Azurite (Blob emulator)
+        run: |
+          docker run -d -p 10000:10000 mcr.microsoft.com/azure-storage/azurite \
+            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck --loose
+          for attempt in $(seq 1 30); do
+            curl -s -o /dev/null http://127.0.0.1:10000/ && exit 0
+            sleep 1
+          done
+          exit 1
+
+      - name: Install database and storage drivers
+        run: pip install "psycopg[binary]>=3.2" "psycopg-pool>=3.2" "azure-storage-blob>=12.20"
+
+      - name: Run suite against PostgreSQL and Azurite
+        shell: bash
+        env:
+          PPE_TEST_DATABASE_URL: postgresql://postgres:test@localhost:5432/safesite_test
+          PPE_TEST_AZURITE_BLOB_URL: http://127.0.0.1:10000/devstoreaccount1
+        run: |
+          ./run_tests.sh 2>&1 | tee test.log
+          if grep -q "skipped 'set PPE_TEST" test.log; then
+            echo "::error::integration cases were skipped"
+            exit 1
+          fi
+
   infrastructure:
     runs-on: ubuntu-latest
     steps:
@@ -30,6 +82,9 @@ jobs:
       # broken template fails here rather than halfway through a deploy.
       - name: Build Bicep template
         run: az bicep build --file infra/main.bicep --stdout > /dev/null
+
+      - name: Build Bicep module
+        run: az bicep build --file infra/modules/postgres-admin.bicep --stdout > /dev/null
 
       - name: Check shell scripts
         run: bash -n infra/bootstrap.sh run_tests.sh

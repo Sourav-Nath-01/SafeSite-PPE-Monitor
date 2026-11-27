@@ -10,8 +10,17 @@ ByteTrack worker identity, geometric person-to-PPE association, and a violation
 audit trail with snapshots -- deployed on **Azure Container Apps** with
 infrastructure as code (Bicep) and passwordless CI/CD from GitHub Actions.
 
-**Live demo:** _add your Container App URL here after the first deploy_ -- try it
-with your webcam, a construction-site photo or a video file.
+**Live demo: https://ca-safesite.redhill-1f5f2c29.uaenorth.azurecontainerapps.io**
+-- try it with your webcam, a construction-site photo or a video file. (It scales
+to zero when idle, so the first visit can take up to a minute to wake it.)
+
+![Per-worker compliance on held-out test images](assets/demo_result.jpg)
+
+*Held-out test images, annotated by the service. Left: each worker is judged on
+their own -- one compliant, five missing a vest or helmet. Right: the helmet on
+the beam is detected but belongs to no one, so it is shown as "unworn" instead
+of counting toward compliance. Images: Construction Site Safety dataset
+(Roboflow Universe), test split.*
 
 ![Alt text](assets/videoconstruc2.gif)
 > 4,764 workers died on the job in 2020 (3.4 per 100,000 full-time equivalent workers). Workers in transportation and material moving occupations and construction and extraction occupations accounted for nearly half of all fatal occupational injuries (47.4 percent), representing 1,282 and 976 workplace deaths, respectively. 
@@ -329,8 +338,8 @@ compliance monitor with a reviewable violation log.
 
 - **`evaluate.py`** - Held-out test-set evaluation
   - Runs on the 82-image `test` split that no model selection touched, and
-    prints a per-class table sorted weakest-first, because an aggregate mAP of
-    0.88 can hide a class that barely works
+    prints a per-class table sorted weakest-first, because an aggregate mAP@50
+    of 0.82 hides a `NO-Hardhat` recall of 0.64
   - `resolve_data_yaml()` rewrites the dataset yaml with absolute split paths,
     so evaluation is reproducible from any working directory
   - Usage: `python evaluate.py --split test --markdown ../metrics_test.md`
@@ -414,26 +423,52 @@ Construction-Site-Safety-PPE-Detection/
 
 The YoloV8s model underwent comprehensive training for **200 epochs** on the construction site safety dataset using an NVIDIA RTX 5060 Ti GPU. The training process completed in approximately **1.92 hours**, demonstrating efficient transfer learning.
 
-#### Final Metrics Achieved (validation split, 114 images):
-| Metric | Value |
-|--------|-------|
-| **Precision** | 0.95 |
-| **Recall** | 0.7975 |
-| **mAP@50%** | 0.8767 |
-| **mAP@50-95%** | 0.6152 |
+#### Held-out test split (82 images, never used for training or model selection)
 
-#### Interpretation:
-- **Precision (0.95)**: Of all PPE detections made by the model, 95% are accurate. This indicates the model has excellent reliability in confirming actual PPE when it flags a detection.
-- **Recall (0.7975)**: The model identifies approximately 80% of all actual PPE instances in the dataset. This ensures good coverage while maintaining acceptable false negative rates.
-- **mAP@50%**: Strong performance at 87.67%, indicating robust detection across all 10 object classes at standard IoU threshold.
-- **mAP@50-95%**: Solid performance of 61.52% across stricter IoU thresholds, demonstrating good localization accuracy of bounding boxes.
+Produced by `python Model-Testing/evaluate.py --split test`. The validation
+figures are shown alongside for reference only: the checkpoint was *selected* on
+the validation split, so those numbers are optimistic by construction.
 
-> **These are validation-split numbers**, and the checkpoint was selected against
-> that split, so they are optimistic by construction. Generate the honest
-> held-out figures with `python Model-Testing/evaluate.py --split test`, which
-> also prints the per-class table -- the aggregate hides that the `Mask` /
-> `NO-Mask` classes are far weaker than `Hardhat` and `Person`, since masks are
-> small, often occluded and under-represented in the training data.
+| Metric | Validation (114 img) | **Test (82 img)** |
+|--------|-------|-------|
+| **Precision** | 0.950 | **0.924** |
+| **Recall** | 0.798 | **0.790** |
+| **mAP@50** | 0.877 | **0.816** |
+| **mAP@50-95** | 0.615 | **0.555** |
+
+Per class on the test split, weakest first:
+
+| Class | Precision | Recall | mAP@50 | mAP@50-95 |
+|---|---|---|---|---|
+| Safety Cone | 0.855 | 0.514 | 0.532 | 0.270 |
+| NO-Hardhat | 0.840 | 0.640 | 0.637 | 0.393 |
+| NO-Mask | 0.908 | 0.759 | 0.823 | 0.465 |
+| vehicle | 0.872 | 0.854 | 0.873 | 0.565 |
+| Mask | 0.965 | 0.750 | 0.776 | 0.580 |
+| NO-Safety Vest | 0.946 | 0.800 | 0.842 | 0.594 |
+| Person | 0.930 | 0.874 | 0.913 | 0.617 |
+| Hardhat | 1.000 | 0.927 | 0.950 | 0.659 |
+| machinery | 0.974 | 0.859 | 0.883 | 0.705 |
+| Safety Vest | 0.954 | 0.918 | 0.932 | 0.706 |
+
+#### What the numbers mean for compliance
+
+- **The positive PPE classes are the reliable ones.** `Hardhat` (P 1.00, R 0.93)
+  and `Safety Vest` (P 0.95, R 0.92) are the strongest classes, and `Person`
+  recall is 0.87 -- the three detections the association step depends on.
+- **The explicit violation class is weak.** `NO-Hardhat` recall is 0.64: the
+  model misses about one bare head in three. A system that only alerted on
+  `NO-Hardhat` boxes would miss a third of violations.
+- **That is why `strict` is the default compliance mode.** Strict mode flags a
+  worker when no *positive* helmet is associated with them, so it rests on the
+  0.93-recall `Hardhat` class rather than the 0.64-recall `NO-Hardhat` class.
+  `explicit` mode (alert only on `NO-*` boxes) trades that recall for precision.
+- **Small objects suffer most.** `Safety Cone` is the weakest class overall;
+  cones are small and frequently partly occluded. They are scene context here,
+  not a compliance input.
+- **Validation-to-test drop** of 0.06 mAP@50 is the expected cost of reporting
+  on data the checkpoint was not chosen on. With 82 test images, treat
+  per-class figures as indicative (wide confidence intervals).
 
 #### Inference performance
 

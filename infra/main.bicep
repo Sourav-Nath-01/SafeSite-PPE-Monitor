@@ -56,6 +56,12 @@ param maxSessions int = 3
 @description('GitHub repository (owner/name) allowed to deploy via OIDC. Empty skips the CI identity.')
 param githubRepo string = ''
 
+@description('Numeric GitHub owner ID. With githubRepoId, also trusts the immutable subject form repo:owner@id/name@id.')
+param githubOwnerId string = ''
+
+@description('Numeric GitHub repository ID (see githubOwnerId).')
+param githubRepoId string = ''
+
 @description('Flask session signing key. Defaults to a fresh value per deployment.')
 @secure()
 param secretKey string = newGuid()
@@ -148,17 +154,41 @@ resource githubIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-0
 
 // Tokens are only accepted from jobs running in the repo's "production"
 // environment, which can carry its own protection rules.
-resource githubFederation 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = if (!empty(githubRepo)) {
+//
+// GitHub issues the subject claim in one of two forms: by name
+// (repo:owner/name:...) or with immutable numeric IDs
+// (repo:owner@123/name@456:...), which survives renames and blocks
+// re-registration of a deleted name. Trust both, so either works.
+var githubParts = split(githubRepo, '/')
+var githubSubjects = concat(
+  [
+    {
+      name: 'github-production'
+      subject: 'repo:${githubRepo}:environment:production'
+    }
+  ],
+  empty(githubRepoId) || empty(githubOwnerId) ? [] : [
+    {
+      name: 'github-production-ids'
+      subject: 'repo:${githubParts[0]}@${githubOwnerId}/${last(githubParts)}@${githubRepoId}:environment:production'
+    }
+  ]
+)
+
+// One at a time: Azure rejects concurrent writes of federated credentials
+// on the same identity.
+@batchSize(1)
+resource githubFederation 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = [for credential in githubSubjects: if (!empty(githubRepo)) {
   parent: githubIdentity
-  name: 'github-production'
+  name: credential.name
   properties: {
     issuer: 'https://token.actions.githubusercontent.com'
-    subject: 'repo:${githubRepo}:environment:production'
+    subject: credential.subject
     audiences: [
       'api://AzureADTokenExchange'
     ]
   }
-}
+}]
 
 // Scoped to this resource group only.
 resource githubRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(githubRepo) && assignRoles) {

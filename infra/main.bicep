@@ -97,7 +97,11 @@ var torchThreads = string(max(1, int(split(cpu, '.')[0])))
 
 var dbLocation = empty(databaseLocation) ? location : databaseLocation
 var storageName = take('st${replace(name, '-', '')}${suffix}', 24)
-var postgresName = 'psql-${name}-${suffix}'
+// The region is part of the name: a server that fails to provision (e.g. a
+// SKU the subscription may not use in that region) can linger in ARM's records
+// under its name, and a name cannot move regions - so a retry elsewhere needs
+// a different name.
+var postgresName = 'psql-${name}-${uniqueString(resourceGroup().id, dbLocation)}'
 var databaseName = 'safesite'
 var blobContainer = 'snapshots'
 // Blob lifecycle works in days; it backs up the app's own hourly retention.

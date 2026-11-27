@@ -26,12 +26,27 @@ class SerialCounter:
     InstanceDetector, but their instance IDs land in one table under a UNIQUE
     constraint. The counter they draw from must therefore be a single object
     behind a lock -- one copy per detector would hand out the same ID twice.
+
+    `floor(date)` returns the highest serial already stored for that day. With
+    a persistent database the counter file can be lost (a container restart)
+    while the rows survive; the floor keeps new IDs above the stored ones.
     """
 
-    def __init__(self, path=COUNTER_FILE):
+    def __init__(self, path=COUNTER_FILE, floor=None):
         self.path = path
+        self._floor = floor
         self._lock = threading.Lock()
         self.date, self.serial = self._load()
+        self.serial = max(self.serial, self._floor_for(self.date))
+
+    def _floor_for(self, date):
+        if self._floor is None:
+            return 0
+        try:
+            return int(self._floor(date))
+        except Exception as e:  # noqa: BLE001 - an unreachable DB must not block IDs
+            print(f"[SerialCounter] Could not read stored serials: {e}")
+            return 0
 
     @staticmethod
     def _today():
@@ -66,7 +81,7 @@ class SerialCounter:
         with self._lock:
             today = self._today()
             if today != self.date:
-                self.date, self.serial = today, 0
+                self.date, self.serial = today, self._floor_for(today)
             self.serial += 1
             self._save()
             return f"{self.date}_{self.serial}"
@@ -341,30 +356,34 @@ class ComplianceChecker:
 
 
 class SnapshotManager:
-    """Write violation snapshots to disk."""
+    """Encode violation snapshots as JPEG and hand them to a snapshot store.
 
-    def __init__(self, snapshot_dir='snapshots'):
-        self.snapshot_dir = snapshot_dir
-        os.makedirs(self.snapshot_dir, exist_ok=True)
+    The store (storage.py) decides where the bytes go: a local directory by
+    default, Azure Blob Storage in the cloud deployment.
+    """
+
+    def __init__(self, snapshot_dir='snapshots', store=None):
+        if store is None:
+            from storage import LocalSnapshotStore
+            store = LocalSnapshotStore(snapshot_dir)
+        self.store = store
 
     def save_snapshot(self, frame, filename):
-        """Save a frame as <snapshot_dir>/<filename>.jpg; return its path."""
+        """Save a frame as <filename>.jpg; return the stored name, or None."""
         try:
             import cv2
 
-            if not filename:
+            if not filename or frame is None or frame.size == 0:
                 return None
 
-            filepath = os.path.join(self.snapshot_dir, f"{filename}.jpg")
+            ok, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            name = f"{filename}.jpg"
+            if ok and self.store.save(name, buffer.tobytes()):
+                print(f"Snapshot saved: {name} ({self.store.kind})")
+                return name
 
-            if frame is not None and frame.size > 0:
-                success = cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                if success and os.path.exists(filepath):
-                    print(f"Snapshot saved: {filepath}")
-                    return filepath
-                print(f"Failed to save snapshot: {filepath}")
-
+            print(f"Failed to save snapshot: {name}")
             return None
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - a failed snapshot must not stop the stream
             print(f"Error saving snapshot: {e}")
             return None

@@ -37,7 +37,7 @@ WORKDIR /app/Model-Deployment
 
 # Fail the build, not the first request, if the weights or tracker deps are
 # broken. Also turns off Ultralytics' anonymous usage telemetry.
-RUN python -c "import lap, gunicorn, simple_websocket; \
+RUN python -c "import lap, gunicorn, simple_websocket, psycopg, psycopg_pool, azure.identity, azure.storage.blob; \
 from ultralytics import YOLO, settings; settings.update({'sync': False}); \
 YOLO('../Model-Training/Outputs/runs/detect/yolov8s_ppe_css_200_epochs/weights/best.pt')"
 

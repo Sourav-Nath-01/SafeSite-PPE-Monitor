@@ -5,6 +5,11 @@
 //                                                         v
 //                                            Azure Container Registry
 //
+// With persistence=true the app also gets durable storage, both reached with
+// a second managed identity (Microsoft Entra tokens, no passwords or keys):
+//   PostgreSQL flexible server  - violation records
+//   Blob Storage                - snapshot images (private container)
+//
 // Deployed in two phases because the app needs an image that lives in the
 // registry this same template creates:
 //   1. deployApp=false  -> registry, identities, environment   (infra/bootstrap.sh)
@@ -56,6 +61,12 @@ param maxSessions int = 3
 @description('GitHub repository (owner/name) allowed to deploy via OIDC. Empty skips the CI identity.')
 param githubRepo string = ''
 
+@description('Store records in PostgreSQL and snapshots in Blob Storage instead of the container\'s temporary disk.')
+param persistence bool = false
+
+@description('Region for the PostgreSQL server; empty uses the main location. Some subscriptions restrict PostgreSQL SKUs by region.')
+param databaseLocation string = ''
+
 @description('Numeric GitHub owner ID. With githubRepoId, also trusts the immutable subject form repo:owner@id/name@id.')
 param githubOwnerId string = ''
 
@@ -84,6 +95,15 @@ var memoryByCpu = {
 // share, and oversubscribes the CPU it actually has.
 var torchThreads = string(max(1, int(split(cpu, '.')[0])))
 
+var dbLocation = empty(databaseLocation) ? location : databaseLocation
+var storageName = take('st${replace(name, '-', '')}${suffix}', 24)
+var postgresName = 'psql-${name}-${suffix}'
+var databaseName = 'safesite'
+var blobContainer = 'snapshots'
+// Blob lifecycle works in days; it backs up the app's own hourly retention.
+var retentionDays = max(1, (retentionHours + 23) / 24)
+
+var blobDataContributorRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
 var acrPullRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
 var contributorRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b24988ac-6180-42a0-ab88-20f7382dd24c')
 
@@ -141,6 +161,158 @@ resource environment 'Microsoft.App/managedEnvironments@2024-03-01' = {
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Persistent storage (persistence=true)
+// ---------------------------------------------------------------------------
+
+// Identity the app uses for its data: PostgreSQL (as Entra admin) and Blob.
+resource appIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: 'id-${name}-app'
+  location: location
+}
+
+resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = if (persistence) {
+  name: storageName
+  location: location
+  sku: {
+    name: 'Standard_LRS'
+  }
+  kind: 'StorageV2'
+  properties: {
+    accessTier: 'Hot'
+    allowBlobPublicAccess: false
+    allowSharedKeyAccess: false // identity-only: no account key works
+    minimumTlsVersion: 'TLS1_2'
+    supportsHttpsTrafficOnly: true
+  }
+}
+
+resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = if (persistence) {
+  parent: storage
+  name: 'default'
+}
+
+resource snapshotContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = if (persistence) {
+  parent: blobService
+  name: blobContainer
+  properties: {
+    publicAccess: 'None'
+  }
+}
+
+resource snapshotLifecycle 'Microsoft.Storage/storageAccounts/managementPolicies@2023-05-01' = if (persistence && retentionHours > 0) {
+  parent: storage
+  name: 'default'
+  properties: {
+    policy: {
+      rules: [
+        {
+          name: 'expire-snapshots'
+          enabled: true
+          type: 'Lifecycle'
+          definition: {
+            filters: {
+              blobTypes: [
+                'blockBlob'
+              ]
+              prefixMatch: [
+                '${blobContainer}/'
+              ]
+            }
+            actions: {
+              baseBlob: {
+                delete: {
+                  daysAfterModificationGreaterThan: retentionDays
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
+
+resource blobRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (persistence && assignRoles) {
+  name: guid(resourceGroup().id, storageName, 'id-${name}-app', blobDataContributorRole)
+  scope: storage
+  properties: {
+    roleDefinitionId: blobDataContributorRole
+    principalId: appIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// Burstable B1ms with 32 GB: the size covered by the 12-month free tier.
+resource postgres 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' = if (persistence) {
+  name: postgresName
+  location: dbLocation
+  sku: {
+    name: 'Standard_B1ms'
+    tier: 'Burstable'
+  }
+  properties: {
+    version: '16'
+    storage: {
+      storageSizeGB: 32
+      autoGrow: 'Disabled'
+    }
+    backup: {
+      backupRetentionDays: 7
+      geoRedundantBackup: 'Disabled'
+    }
+    highAvailability: {
+      mode: 'Disabled'
+    }
+    network: {
+      publicNetworkAccess: 'Enabled'
+    }
+    // Entra-only: password sign-in is switched off entirely.
+    authConfig: {
+      activeDirectoryAuth: 'Enabled'
+      passwordAuth: 'Disabled'
+      tenantId: tenant().tenantId
+    }
+  }
+}
+
+// Consumption-plan Container Apps have no fixed outbound IP; 0.0.0.0 is
+// Azure's convention for "connections from Azure services only".
+resource postgresFirewall 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2024-08-01' = if (persistence) {
+  parent: postgres
+  name: 'AllowAzureServices'
+  properties: {
+    startIpAddress: '0.0.0.0'
+    endIpAddress: '0.0.0.0'
+  }
+}
+
+// The server accepts one change at a time, hence the explicit chain below.
+resource postgresDatabase 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2024-08-01' = if (persistence) {
+  parent: postgres
+  name: databaseName
+  properties: {
+    charset: 'UTF8'
+    collation: 'en_US.utf8'
+  }
+  dependsOn: [
+    postgresFirewall
+  ]
+}
+
+module postgresAdmin 'modules/postgres-admin.bicep' = if (persistence) {
+  name: 'postgres-admin'
+  params: {
+    serverName: postgresName
+    principalId: appIdentity.properties.principalId
+    principalName: appIdentity.name
+  }
+  dependsOn: [
+    postgres
+    postgresDatabase
+  ]
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +388,7 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = if (deployApp) {
     type: 'UserAssigned'
     userAssignedIdentities: {
       '${pullIdentity.id}': {}
+      '${appIdentity.id}': {}
     }
   }
   properties: {
@@ -290,7 +463,31 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = if (deployApp) {
                 name: 'PPE_ADMIN_PASSWORD'
                 secretRef: 'admin-password'
               }
-            ]
+            ],
+            persistence ? [
+              {
+                // Which of the app's identities DefaultAzureCredential uses.
+                name: 'AZURE_CLIENT_ID'
+                value: appIdentity.properties.clientId
+              }
+              {
+                // No password: the app signs in with an Entra token (PPE_DB_AUTH).
+                name: 'PPE_DATABASE_URL'
+                value: 'host=${postgres!.properties.fullyQualifiedDomainName} port=5432 dbname=${databaseName} user=${appIdentity.name} sslmode=require'
+              }
+              {
+                name: 'PPE_DB_AUTH'
+                value: 'entra'
+              }
+              {
+                name: 'PPE_BLOB_ACCOUNT_URL'
+                value: storage!.properties.primaryEndpoints.blob
+              }
+              {
+                name: 'PPE_BLOB_CONTAINER'
+                value: blobContainer
+              }
+            ] : []
           )
           probes: [
             {
@@ -329,6 +526,8 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = if (deployApp) {
   }
   dependsOn: [
     pullRole
+    postgresAdmin
+    snapshotContainer
   ]
 }
 
@@ -341,5 +540,7 @@ output registryLoginServer string = registry.properties.loginServer
 output appName string = appName
 output appUrl string = deployApp ? 'https://${app!.properties.configuration.ingress.fqdn}' : ''
 output githubClientId string = empty(githubRepo) ? '' : githubIdentity!.properties.clientId
+output databaseServer string = persistence ? postgresName : ''
+output storageAccount string = persistence ? storageName : ''
 output tenantId string = tenant().tenantId
 output subscriptionId string = subscription().subscriptionId

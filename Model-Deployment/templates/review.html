@@ -60,6 +60,16 @@
             gap: 12px;
         }
 
+        .scope-notice {
+            background: rgba(74, 144, 226, 0.08);
+            border: 1px solid rgba(74, 144, 226, 0.25);
+            border-radius: 10px;
+            padding: 12px 16px;
+            margin-bottom: 24px;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
         .nav-links {
             margin-top: 12px;
             display: flex;
@@ -458,6 +468,12 @@
     </header>
 
     <div class="container">
+        {% if admin_view %}
+        <div class="scope-notice"><i class="fas fa-user-shield"></i> Admin view: violations from every visitor and camera.</div>
+        {% elif public_demo %}
+        <div class="scope-notice"><i class="fas fa-user-lock"></i> You are seeing only the violations recorded from your own browser
+            {% if retention_hours %}- they are deleted automatically after {{ retention_hours|round|int }} hours{% endif %}.</div>
+        {% endif %}
         <div class="card">
             <div class="card-title">Non-Compliant Instances</div>
             
@@ -511,11 +527,14 @@
     </div>
 
     <script>
+        // ?all=1 asks for every visitor's rows; the server requires admin login for it.
+        const ADMIN_VIEW = {{ 'true' if admin_view else 'false' }};
+
         function loadInstances() {
             const sortBy = document.getElementById('sortBy').value;
             const sortOrder = document.getElementById('sortOrder').value;
 
-            fetch(`/api/instances?sort=${sortBy}&order=${sortOrder}`)
+            fetch(`/api/instances?sort=${sortBy}&order=${sortOrder}${ADMIN_VIEW ? '&all=1' : ''}`)
                 .then(response => response.json())
                 .then(data => {
                     const grid = document.getElementById('instancesGrid');
@@ -576,6 +595,10 @@
                                     <div class="instance-time">
                                         <i class="fas fa-images"></i> ${instance.snapshot_count} snapshot(s)
                                     </div>
+                                    ${instance.track_id !== null && instance.track_id !== undefined ? `
+                                    <div class="instance-time">
+                                        <i class="fas fa-helmet-safety"></i> Worker #${instance.track_id}
+                                    </div>` : ''}
                                     <div class="ppe-info">
                                         ${detectedPPE}
                                         ${missingPPE}
@@ -654,10 +677,10 @@
                                     const time = new Date(snapshot.timestamp).toLocaleString();
                                     return `
                                         <div class="snapshot-item">
-                                            <img src="/${snapshot.path}" 
+                                            <img src="${snapshot.url}" 
                                                  alt="Snapshot ${index + 1}" 
                                                  class="snapshot-image"
-                                                 onclick="window.open('/${snapshot.path}', '_blank')">
+                                                 onclick="window.open('${snapshot.url}', '_blank')">
                                             <div class="snapshot-info">
                                                 <div class="snapshot-number">Snapshot #${index + 1}</div>
                                                 <div class="snapshot-time">

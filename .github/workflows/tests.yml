@@ -13,9 +13,58 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
-      # The compliance logic imports no torch, OpenCV or numpy by design, so the
-      # suite runs on a bare interpreter in seconds - no weights, GPU or camera.
+      # The compliance logic, settings validation and database layer import no
+      # torch, OpenCV or numpy by design, so the suite runs on a bare
+      # interpreter in seconds - no weights, GPU or camera.
       - name: Run compliance test suite
         run: ./run_tests.sh
+
+  infrastructure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Compiles and lints the Bicep template (no Azure login needed), so a
+      # broken template fails here rather than halfway through a deploy.
+      - name: Build Bicep template
+        run: az bicep build --file infra/main.bicep --stdout > /dev/null
+
+      - name: Check shell scripts
+        run: bash -n infra/bootstrap.sh run_tests.sh
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Same image the deploy workflow ships, so a broken Dockerfile fails a
+      # pull request rather than a release. The cache is shared with deploy.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: safesite:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Boot it the way Container Apps will (gunicorn, public-demo mode) and
+      # push one real image through the model.
+      - name: Smoke test the container
+        run: |
+          docker run -d --name safesite -p 3333:3333 -e PPE_PUBLIC_DEMO=true safesite:ci
+          for attempt in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3333/healthz; then
+              echo
+              curl -fsS -F image=@Model-Training/Outputs/runs/detect/yolov8s_ppe_css_200_epochs/val_batch0_labels.jpg \
+                http://127.0.0.1:3333/api/detect | python3 -c "import json, sys; d = json.load(sys.stdin); assert d['status'] == 'success', d; print('detect OK:', d['update']['detection_details']['person_count'], 'workers,', d['update']['inference_ms'], 'ms')"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs safesite
+          exit 1

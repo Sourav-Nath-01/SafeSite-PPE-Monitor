@@ -69,11 +69,21 @@ def draw_unassigned(frame, item):
 
 
 def draw_hud(frame, fps, person_count, violation_count, inference_ms=None):
-    """Top-left status readout: throughput, headcount, live violation count."""
+    """Top-left status readout: throughput, headcount, live violation count.
+
+    `fps=None` marks a still image, where only the inference time means anything.
+    """
+    perf = []
+    if fps is not None:
+        perf.append(f"FPS {fps:.1f}")
+    if inference_ms is not None:
+        perf.append(f"{inference_ms:.1f} ms")
+
     lines = [
-        f"FPS {fps:.1f}" + (f" | {inference_ms:.1f} ms" if inference_ms is not None else ""),
+        " | ".join(perf),
         f"Workers {person_count} | Violations {violation_count}",
     ]
+    lines = [line for line in lines if line]
 
     y = 10
     for line in lines:

@@ -1,15 +1,19 @@
 # Runtime for the detection service and the training/eval scripts.
 # Install PyTorch first for your CUDA version - see requirements-long.txt.
-ultralytics>=8.3.0
+ultralytics>=8.3.0,<9
 opencv-python>=4.8.0
 numpy>=1.24
 PyYAML>=6.0
+# ByteTrack's assignment solver. Without it Ultralytics pip-installs it at
+# runtime, on the first tracked frame - which fails in a locked-down container.
+lap>=0.5.12
 
 # Web application
 Flask>=3.0
 Flask-SocketIO>=5.3
 python-socketio>=5.10
-eventlet>=0.35
+simple-websocket>=1.0     # WebSocket transport for the threading async mode
+gunicorn>=22.0            # production server (see Model-Deployment/gunicorn.conf.py)
 Pillow>=10.0
 
 # Optional: ONNX Runtime inference path used by Model-Testing/benchmark.py

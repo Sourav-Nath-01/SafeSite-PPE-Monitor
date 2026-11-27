@@ -8,14 +8,68 @@ one violation does not mask the other's compliance.
 Geometry lives in ppe_association; this module owns time.
 """
 
+import json
+import os
+import threading
 import time
 from datetime import datetime
-import os
-import json
 
 from ppe_association import associate, PPE_TYPES
 
 COUNTER_FILE = 'instance_counter.json'
+
+
+class SerialCounter:
+    """Daily violation serial, shared by every detector in the process.
+
+    Each video source (the site camera, every browser session) runs its own
+    InstanceDetector, but their instance IDs land in one table under a UNIQUE
+    constraint. The counter they draw from must therefore be a single object
+    behind a lock -- one copy per detector would hand out the same ID twice.
+    """
+
+    def __init__(self, path=COUNTER_FILE):
+        self.path = path
+        self._lock = threading.Lock()
+        self.date, self.serial = self._load()
+
+    @staticmethod
+    def _today():
+        return datetime.now().strftime('%m_%d_%Y')
+
+    def _load(self):
+        """Today's serial from disk, restarting the numbering on a new day."""
+        today = self._today()
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, 'r') as f:
+                    data = json.load(f)
+                if data.get('date') == today:
+                    print(f"[SerialCounter] Loaded serial counter: {data.get('serial', 0)} for {today}")
+                    return today, int(data.get('serial', 0))
+        except (OSError, ValueError) as e:
+            print(f"[SerialCounter] Error loading counter: {e}")
+
+        print(f"[SerialCounter] Starting new serial counter for {today}")
+        return today, 0
+
+    def _save(self):
+        """Persist the serial so restarts do not reuse instance IDs."""
+        try:
+            with open(self.path, 'w') as f:
+                json.dump({'date': self.date, 'serial': self.serial}, f)
+        except OSError as e:
+            print(f"[SerialCounter] Error saving counter: {e}")
+
+    def next_id(self):
+        """Next violation ID, formatted MM_DD_YYYY_Serial."""
+        with self._lock:
+            today = self._today()
+            if today != self.date:
+                self.date, self.serial = today, 0
+            self.serial += 1
+            self._save()
+            return f"{self.date}_{self.serial}"
 
 
 class TrackState:
@@ -39,10 +93,12 @@ class TrackState:
 class InstanceDetector:
     """Turn per-frame detections into confirmed, per-worker PPE violations."""
 
-    def __init__(self, window_seconds=5):
+    def __init__(self, window_seconds=5, counter=None):
         self.window_seconds = window_seconds          # track eviction timeout
         self.non_compliance_delay = 3                 # debounce before alerting
-        self.instance_serial = self._load_serial_counter()
+        # Pass one SerialCounter to every detector in a process; a detector
+        # created on its own gets a private one (the single-source default).
+        self.counter = counter if counter is not None else SerialCounter()
 
         self.required_ppe_settings = {
             'helmet': True,
@@ -57,43 +113,9 @@ class InstanceDetector:
         self.tracks = {}
         self.current_instance_id = None   # most recent confirmed violation
 
-    # ------------------------------------------------------------------
-    # Serial counter persistence
-    # ------------------------------------------------------------------
-
-    def _load_serial_counter(self):
-        """Load today's serial counter, restarting the numbering on a new day."""
-        today = datetime.now().strftime('%m_%d_%Y')
-
-        try:
-            if os.path.exists(COUNTER_FILE):
-                with open(COUNTER_FILE, 'r') as f:
-                    data = json.load(f)
-                    if data.get('date') == today:
-                        print(f"[InstanceDetector] Loaded serial counter: {data.get('serial', 0)} for {today}")
-                        return data.get('serial', 0)
-        except Exception as e:
-            print(f"[InstanceDetector] Error loading counter: {e}")
-
-        print(f"[InstanceDetector] Starting new serial counter for {today}")
-        return 0
-
-    def _save_serial_counter(self):
-        """Persist the serial counter so restarts do not reuse instance IDs."""
-        today = datetime.now().strftime('%m_%d_%Y')
-
-        try:
-            with open(COUNTER_FILE, 'w') as f:
-                json.dump({'date': today, 'serial': self.instance_serial}, f)
-        except Exception as e:
-            print(f"[InstanceDetector] Error saving counter: {e}")
-
     def _generate_instance_id(self):
         """Next violation ID, formatted MM_DD_YYYY_Serial."""
-        today = datetime.now().strftime('%m_%d_%Y')
-        self.instance_serial += 1
-        self._save_serial_counter()
-        return f"{today}_{self.instance_serial}"
+        return self.counter.next_id()
 
     # ------------------------------------------------------------------
     # Settings
@@ -240,13 +262,7 @@ class InstanceDetector:
         }
 
     def _describe_unassigned(self, item):
-        """PPE that belongs to nobody -- surfaced instead of counted as worn."""
-        return {
-            'ppe_type': item['ppe_type'],
-            'class': item['class'],
-            'bbox': [int(round(v)) for v in item['bbox']],
-            'confidence': round(float(item['confidence']), 3),
-        }
+        return describe_unassigned(item)
 
     def get_next_snapshot_filename(self, instance_id=None):
         """Next snapshot name for a violation, as <instance_id>_snapshot_<n>."""
@@ -261,6 +277,57 @@ class InstanceDetector:
                 return f"{instance_id}_snapshot_{track.snapshot_counter}"
 
         return f"{instance_id}_snapshot_1"
+
+
+def describe_unassigned(item):
+    """PPE that belongs to nobody -- surfaced instead of counted as worn."""
+    return {
+        'ppe_type': item['ppe_type'],
+        'class': item['class'],
+        'bbox': [int(round(v)) for v in item['bbox']],
+        'confidence': round(float(item['confidence']), 3),
+    }
+
+
+def evaluate_still(detections, required_ppe, strict=True):
+    """Compliance for a single image: association, but no tracking or debounce.
+
+    A photo has no "next frame" for a violation to persist into, so every
+    worker missing required PPE is reported at once. Nothing is logged and no
+    instance ID is drawn -- an uploaded image is a query, not an event.
+
+    Returns the same shape as InstanceDetector.process_detection, so the
+    dashboard and the overlay render both without special cases.
+    """
+    people, unassigned = associate(detections)
+
+    persons = []
+    for person in people:
+        view = person.to_dict(required_ppe, strict)
+        view['violation_confirmed'] = not view['is_compliant']
+        persons.append(view)
+
+    violating = [p for p in persons if p['violation_confirmed']]
+
+    return {
+        'instance_id': None,
+        'has_person': bool(persons),
+        'is_compliant': not violating,
+        'missing_ppe': sorted({m for p in violating for m in p['missing_ppe']}),
+        'detected_ppe': sorted({w for p in persons for w in p['worn']}),
+        'should_capture': False,
+        'person_count': len(persons),
+        'violation_count': len(violating),
+        'persons': persons,
+        'violations': [{
+            'instance_id': None,
+            'track_id': p['track_id'],
+            'missing_ppe': p['missing_ppe'],
+            'worn': p['worn'],
+            'bbox': p['bbox'],
+        } for p in violating],
+        'unassigned_ppe': [describe_unassigned(u) for u in unassigned],
+    }
 
 
 class ComplianceChecker:
@@ -278,8 +345,7 @@ class SnapshotManager:
 
     def __init__(self, snapshot_dir='snapshots'):
         self.snapshot_dir = snapshot_dir
-        if not os.path.exists(self.snapshot_dir):
-            os.makedirs(self.snapshot_dir)
+        os.makedirs(self.snapshot_dir, exist_ok=True)
 
     def save_snapshot(self, frame, filename):
         """Save a frame as <snapshot_dir>/<filename>.jpg; return its path."""

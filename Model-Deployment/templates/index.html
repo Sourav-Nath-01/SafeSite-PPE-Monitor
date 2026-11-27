@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PPE Detection System</title>
+    <title>SafeSite PPE Monitor</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -366,7 +366,73 @@
             color: var(--accent-red);
         }
 
+        .source-tabs {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+        }
+
+        .source-tab {
+            padding: 8px 14px;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            background: var(--bg-secondary);
+            color: var(--text-secondary);
+            font-family: 'Poppins', sans-serif;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .source-tab.active {
+            border-color: var(--accent-blue);
+            color: var(--accent-blue);
+            background: rgba(74, 144, 226, 0.08);
+        }
+
+        .source-tab:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .source-hint {
+            margin-top: 12px;
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+
+        .source-hint.error {
+            color: var(--accent-red);
+        }
+
+        .demo-banner {
+            background: rgba(74, 144, 226, 0.08);
+            border: 1px solid rgba(74, 144, 226, 0.25);
+            color: var(--text-primary);
+            border-radius: 10px;
+            padding: 12px 16px;
+            margin-bottom: 24px;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
+        .capture-only {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            opacity: 0;
+            pointer-events: none;
+        }
+
         @media (max-width: 968px) {
+            .video-container {
+                min-height: 260px;
+            }
+
             .grid {
                 grid-template-columns: 1fr;
             }
@@ -392,6 +458,14 @@
     </header>
 
     <div class="container">
+        {% if public_demo %}
+        <div class="demo-banner">
+            <i class="fas fa-info-circle"></i>
+            <strong>Live demo.</strong> Point your webcam at someone (a cap counts as a missing hard hat), upload a
+            construction-site photo or play a video file. Frames are analysed in memory on the server; violation
+            snapshots are visible only to you{% if retention_hours %} and are deleted after {{ retention_hours|round|int }} hours{% endif %}.
+        </div>
+        {% endif %}
         <div class="grid">
             <div class="card">
                 <div class="card-title">
@@ -403,24 +477,47 @@
                         <i class="fas fa-flask"></i> DEV MODE
                     </div> -->
                 </div>
+                <div class="source-tabs" id="sourceTabs">
+                    <button class="source-tab active" data-source="webcam" onclick="selectSource('webcam')">
+                        <i class="fas fa-video"></i> Webcam
+                    </button>
+                    <button class="source-tab" data-source="video" onclick="selectSource('video')">
+                        <i class="fas fa-film"></i> Video file
+                    </button>
+                    <button class="source-tab" data-source="image" onclick="selectSource('image')">
+                        <i class="fas fa-image"></i> Image
+                    </button>
+                    {% if server_camera %}
+                    <button class="source-tab" data-source="server" onclick="selectSource('server')">
+                        <i class="fas fa-server"></i> Site camera
+                    </button>
+                    {% endif %}
+                </div>
                 <div class="video-container">
-                    <img id="videoFeed" alt="Video Feed">
+                    <img id="videoFeed" alt="Annotated detection feed">
                     <div class="video-placeholder" id="placeholder">
                         <i class="fas fa-video" style="font-size: 48px; margin-bottom: 16px; opacity: 0.3;"></i>
-                        <p>Click "Start Stream" to begin detection</p>
+                        <p id="placeholderText">Choose a source and press Start</p>
                     </div>
+                    <!-- Browser-side capture: the raw video is sampled into the canvas and
+                         sent to the server; only the annotated result is displayed. -->
+                    <video id="localVideo" class="capture-only" playsinline muted></video>
+                    <canvas id="captureCanvas" class="capture-only"></canvas>
                 </div>
+                <input type="file" id="videoInput" accept="video/*" hidden>
+                <input type="file" id="imageInput" accept="image/*" hidden>
                 <div class="controls">
-                    <button class="btn btn-primary" id="startBtn" onclick="startStream()">
-                        <i class="fas fa-play"></i> Start Stream
+                    <button class="btn btn-primary" id="startBtn" onclick="startSource()">
+                        <i class="fas fa-play"></i> <span id="startLabel">Start</span>
                     </button>
-                    <button class="btn btn-danger" id="stopBtn" onclick="stopStream()" disabled>
-                        <i class="fas fa-stop"></i> Stop Stream
+                    <button class="btn btn-danger" id="stopBtn" onclick="stopSource()" disabled>
+                        <i class="fas fa-stop"></i> Stop
                     </button>
                     <!-- <button class="btn btn-warning" id="devModeBtn" onclick="toggleDevMode()">
                         <i class="fas fa-flask"></i> Toggle Dev Mode
                     </button> -->
                 </div>
+                <div class="source-hint" id="sourceHint"></div>
                 <div class="compliance-status compliant" id="complianceStatus">
                     <i class="fas fa-check-circle"></i> ALL COMPLIANT
                 </div>
@@ -464,83 +561,343 @@
 
     <script>
         const socket = io();
-        let isStreaming = false;
+
+        // Frames are downscaled in the browser before upload: the detector runs
+        // at 640 px anyway, and a smaller JPEG is most of the round-trip time.
+        const MAX_SIDE = 640;
+        const JPEG_QUALITY = 0.75;
+
+        const START_LABELS = {
+            webcam: 'Start webcam',
+            video: 'Choose video',
+            image: 'Choose image',
+            server: 'Start site camera',
+        };
+
+        let selectedSource = 'webcam';
+        let activeSource = null;     // 'webcam' | 'video' | 'server' while running
+        let streamToken = 0;         // invalidates callbacks from a previous run
+        let inFlight = false;
+        let mediaStream = null;
+        let videoUrl = null;
+        let frameUrl = null;
         let devMode = false;
 
-        function startStream() {
+        const el = id => document.getElementById(id);
+
+        // ------------------------------------------------------------------
+        // Source selection and UI state
+        // ------------------------------------------------------------------
+
+        function selectSource(source) {
+            if (activeSource) return;
+            selectedSource = source;
+            document.querySelectorAll('.source-tab').forEach(tab =>
+                tab.classList.toggle('active', tab.dataset.source === source));
+            el('startLabel').textContent = START_LABELS[source];
+            setHint('');
+        }
+
+        function setHint(text, isError = false) {
+            const hint = el('sourceHint');
+            hint.textContent = text;
+            hint.className = 'source-hint' + (isError ? ' error' : '');
+        }
+
+        function setRunning(source) {
+            activeSource = source;
+            const running = source !== null;
+            el('startBtn').disabled = running;
+            el('stopBtn').disabled = !running;
+            document.querySelectorAll('.source-tab').forEach(tab => { tab.disabled = running; });
+            el('statusIndicator').classList.toggle('active', running);
+            el('statusIndicator').classList.toggle('inactive', !running);
+        }
+
+        function showFeed(src) {
+            const feed = el('videoFeed');
+            feed.src = src;
+            feed.style.display = 'block';
+            el('placeholder').style.display = 'none';
+        }
+
+        function hideFeed() {
+            const feed = el('videoFeed');
+            feed.removeAttribute('src');
+            feed.style.display = 'none';
+            el('placeholder').style.display = 'block';
+            if (frameUrl) {
+                URL.revokeObjectURL(frameUrl);
+                frameUrl = null;
+            }
+        }
+
+        function startSource() {
+            setHint('');
+            if (selectedSource === 'webcam') startWebcam();
+            else if (selectedSource === 'video') el('videoInput').click();
+            else if (selectedSource === 'image') el('imageInput').click();
+            else if (selectedSource === 'server') startServerCamera();
+        }
+
+        function stopSource() {
+            const source = activeSource;
+            streamToken += 1;
+            inFlight = false;
+            setRunning(null);
+
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+                mediaStream = null;
+            }
+            const video = el('localVideo');
+            video.pause();
+            video.srcObject = null;
+            video.removeAttribute('src');
+            if (videoUrl) {
+                URL.revokeObjectURL(videoUrl);
+                videoUrl = null;
+            }
+
+            if (source === 'webcam' || source === 'video') {
+                socket.emit('client_stop');
+            } else if (source === 'server') {
+                fetch('/stop_stream', { method: 'POST' }).catch(() => {});
+            }
+            hideFeed();
+        }
+
+        // ------------------------------------------------------------------
+        // Browser-fed video: webcam or a local video file
+        // ------------------------------------------------------------------
+
+        async function startWebcam() {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                setHint('This browser cannot open a camera on this page (camera access requires HTTPS).', true);
+                return;
+            }
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+                    audio: false,
+                });
+            } catch (err) {
+                setHint('Camera permission was denied, or no camera was found.', true);
+                return;
+            }
+            const video = el('localVideo');
+            video.srcObject = mediaStream;
+            await video.play();
+            beginBrowserStream('webcam');
+        }
+
+        el('videoInput').addEventListener('change', async event => {
+            const file = event.target.files[0];
+            event.target.value = '';    // allow picking the same file again
+            if (!file) return;
+
+            const video = el('localVideo');
+            videoUrl = URL.createObjectURL(file);
+            video.srcObject = null;
+            video.src = videoUrl;
+            video.loop = true;
+            try {
+                await video.play();
+            } catch (err) {
+                URL.revokeObjectURL(videoUrl);
+                videoUrl = null;
+                setHint('Your browser cannot play this video format - try an MP4 (H.264) file.', true);
+                return;
+            }
+            beginBrowserStream('video');
+        });
+
+        function beginBrowserStream(source) {
+            setRunning(source);
+            const token = ++streamToken;
+            setHint('Connecting to the detector...');
+            openSession(token, () => {
+                setHint(source === 'webcam'
+                    ? 'Streaming from your webcam. Workers are tracked across frames; a violation must persist before it is logged.'
+                    : 'Streaming your video file (looped).');
+                sendFrame();
+            });
+        }
+
+        // Each browser gets its own tracker and violation state on the server.
+        function openSession(token, onReady) {
+            socket.timeout(30000).emit('client_start', (err, res) => {
+                if (token !== streamToken) return;
+                if (err || !res || !res.ok) {
+                    const message = err ? 'The server did not respond. Please try again.' : res.error;
+                    stopSource();
+                    setHint(message, true);
+                    return;
+                }
+                onReady();
+            });
+        }
+
+        function sendFrame() {
+            const token = streamToken;
+            if (!activeSource || activeSource === 'server' || inFlight) return;
+
+            const video = el('localVideo');
+            if (video.readyState < 2 || !video.videoWidth) {
+                setTimeout(sendFrame, 100);
+                return;
+            }
+
+            const scale = Math.min(1, MAX_SIDE / Math.max(video.videoWidth, video.videoHeight));
+            const canvas = el('captureCanvas');
+            canvas.width = Math.round(video.videoWidth * scale);
+            canvas.height = Math.round(video.videoHeight * scale);
+            canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+
+            inFlight = true;
+            canvas.toBlob(blob => {
+                if (token !== streamToken || !blob) {
+                    if (token === streamToken) inFlight = false;
+                    return;
+                }
+                blob.arrayBuffer().then(buffer => {
+                    socket.timeout(20000).emit('client_frame', buffer, (err, res) => {
+                        if (token !== streamToken) return;
+                        inFlight = false;
+                        handleFrameResult(token, err, res);
+                    });
+                });
+            }, 'image/jpeg', JPEG_QUALITY);
+        }
+
+        function handleFrameResult(token, err, res) {
+            if (err) {
+                setHint('The server is slow to respond - retrying...', true);
+                setTimeout(sendFrame, 1000);
+                return;
+            }
+            if (!res.ok) {
+                if (res.busy) {
+                    setTimeout(sendFrame, 50);
+                } else if (res.error === 'not_started') {
+                    // Reconnected with a new socket, or the idle session was reclaimed.
+                    openSession(token, sendFrame);
+                } else {
+                    stopSource();
+                    setHint(res.error || 'The server rejected the frame.', true);
+                }
+                return;
+            }
+
+            const url = URL.createObjectURL(new Blob([res.frame], { type: 'image/jpeg' }));
+            showFeed(url);
+            if (frameUrl) URL.revokeObjectURL(frameUrl);
+            frameUrl = url;
+
+            renderUpdate(res.update);
+            if (res.alert) renderAlert(res.alert);
+
+            // rAF pauses in a background tab, so a hidden page stops uploading.
+            requestAnimationFrame(sendFrame);
+        }
+
+        // ------------------------------------------------------------------
+        // Single image: stateless check, nothing is stored
+        // ------------------------------------------------------------------
+
+        el('imageInput').addEventListener('change', event => {
+            const file = event.target.files[0];
+            event.target.value = '';
+            if (!file) return;
+
+            const form = new FormData();
+            form.append('image', file);
+            setHint('Analysing image...');
+            el('startBtn').disabled = true;
+
+            fetch('/api/detect', { method: 'POST', body: form })
+                .then(response => response.json()
+                    .catch(() => ({ message: `Upload failed (HTTP ${response.status})` }))
+                    .then(data => ({ ok: response.ok, data })))
+                .then(({ ok, data }) => {
+                    if (!ok || data.status !== 'success') {
+                        throw new Error(data.message || 'Detection failed');
+                    }
+                    if (frameUrl) {
+                        URL.revokeObjectURL(frameUrl);
+                        frameUrl = null;
+                    }
+                    showFeed(data.image);
+                    renderUpdate(data.update);
+                    const details = data.update.detection_details;
+                    setHint(`${details.person_count} worker(s), ${details.violation_count} violation(s), ` +
+                            `${Math.round(data.update.inference_ms)} ms. Choose another image to try again.`);
+                })
+                .catch(err => setHint(err.message, true))
+                .finally(() => { el('startBtn').disabled = false; });
+        });
+
+        // ------------------------------------------------------------------
+        // Site camera (on-prem): MJPEG from the server, results broadcast
+        // ------------------------------------------------------------------
+
+        function startServerCamera() {
             fetch('/start_stream', { method: 'POST' })
                 .then(response => response.json())
                 .then(data => {
-                    isStreaming = true;
-                    document.getElementById('videoFeed').src = '/video_feed?t=' + new Date().getTime();
-                    document.getElementById('videoFeed').style.display = 'block';
-                    document.getElementById('placeholder').style.display = 'none';
-                    document.getElementById('startBtn').disabled = true;
-                    document.getElementById('stopBtn').disabled = false;
-                    document.getElementById('statusIndicator').classList.add('active');
-                    document.getElementById('statusIndicator').classList.remove('inactive');
-                });
+                    if (data.status !== 'success') throw new Error(data.message);
+                    setRunning('server');
+                    showFeed('/video_feed?t=' + Date.now());
+                    setHint('Streaming from the site camera.');
+                })
+                .catch(err => setHint(err.message || 'Could not start the site camera.', true));
         }
 
-        function stopStream() {
-            isStreaming = false;
-            const videoFeed = document.getElementById('videoFeed');
-            videoFeed.src = '';
-            videoFeed.style.display = 'none';
-            document.getElementById('placeholder').style.display = 'block';
-            document.getElementById('startBtn').disabled = false;
-            document.getElementById('stopBtn').disabled = true;
-            document.getElementById('statusIndicator').classList.remove('active');
-            document.getElementById('statusIndicator').classList.add('inactive');
-            
-            fetch('/stop_stream', { method: 'POST' })
-                .then(response => response.json())
-                .then(data => console.log('Stream stopped:', data.message))
-                .catch(error => console.error('Error stopping stream:', error));
-        }
+        socket.on('detection_update', data => {
+            if (activeSource === 'server') renderUpdate(data);
+        });
+
+        socket.on('alert', data => {
+            if (activeSource === 'server') renderAlert(data);
+        });
 
         function toggleDevMode() {
             fetch('/toggle_dev_mode', { method: 'POST' })
                 .then(response => response.json())
                 .then(data => {
                     devMode = data.dev_mode;
-                    const btn = document.getElementById('devModeBtn');
-                    const indicator = document.getElementById('devModeIndicator');
-                    if (devMode) {
-                        btn.classList.add('active');
-                        indicator.style.display = 'inline-flex';
-                    } else {
-                        btn.classList.remove('active');
-                        indicator.style.display = 'none';
-                    }
                     alert(data.message);
                 })
                 .catch(error => console.error('Error toggling dev mode:', error));
         }
 
-        socket.on('alert', function(data) {
-            const alertList = document.getElementById('alertList');
-            
+        // ------------------------------------------------------------------
+        // Rendering (shared by every source)
+        // ------------------------------------------------------------------
+
+        function renderAlert(data) {
+            const alertList = el('alertList');
+
             if (alertList.querySelector('p')) {
                 alertList.innerHTML = '';
             }
-            
+
             const alertItem = document.createElement('div');
             alertItem.className = 'alert-item';
-            
+
             const time = new Date(data.timestamp).toLocaleTimeString();
             const devModeTag = data.dev_mode ? ' <span style="color: var(--accent-orange);">[DEV]</span>' : '';
             alertItem.innerHTML = `
                 <div class="alert-time"><i class="fas fa-exclamation-triangle"></i> ${time}${devModeTag}</div>
                 <div class="alert-message">${data.description}</div>
             `;
-            
+
             alertList.insertBefore(alertItem, alertList.firstChild);
             updateStats();
-        });
+        }
 
-        socket.on('detection_update', function(data) {
-            const statusDiv = document.getElementById('complianceStatus');
+        function renderUpdate(data) {
+            const statusDiv = el('complianceStatus');
             if (data.is_compliant) {
                 statusDiv.className = 'compliance-status compliant';
                 statusDiv.innerHTML = '<i class="fas fa-check-circle"></i> ALL COMPLIANT';
@@ -548,8 +905,8 @@
                 statusDiv.className = 'compliance-status non-compliant';
                 statusDiv.innerHTML = '<i class="fas fa-exclamation-triangle"></i> NON-COMPLIANT DETECTED';
             }
-            
-            const personsDiv = document.getElementById('currentPersons');
+
+            const personsDiv = el('currentPersons');
             const details = data.detection_details;
 
             if (!details || !details.has_person) {
@@ -607,17 +964,18 @@
             }
 
             personsDiv.innerHTML = renderPerfLine(data) + cards + unassigned;
-        });
+        }
 
         function renderPerfLine(data) {
             const details = data.detection_details || {};
-            const fps = data.fps !== undefined && data.fps !== null ? data.fps.toFixed(1) : '--';
-            const ms = data.inference_ms ? `${data.inference_ms.toFixed(1)} ms` : '--';
+            const parts = [];
+            if (data.fps !== undefined && data.fps !== null) parts.push(`${data.fps.toFixed(1)} FPS`);
+            parts.push(data.inference_ms ? `${data.inference_ms.toFixed(1)} ms/frame` : '-- ms/frame');
+            parts.push(`${details.person_count || 0} worker(s)`);
+            parts.push(`${details.violation_count || 0} violation(s)`);
 
             return `<div style="margin-bottom: 10px; font-size: 12px; color: var(--text-secondary);">
-                ${fps} FPS &middot; ${ms}/frame &middot;
-                ${details.person_count || 0} worker(s) &middot;
-                ${details.violation_count || 0} violation(s)
+                ${parts.join(' &middot; ')}
             </div>`;
         }
 
@@ -625,28 +983,19 @@
             fetch('/stats')
                 .then(response => response.json())
                 .then(data => {
-                    document.getElementById('totalDetections').textContent = data.total_detections;
-                    document.getElementById('nonCompliantCount').textContent = data.non_compliant_count;
-                    document.getElementById('totalAlerts').textContent = data.total_alerts;
-                    
+                    el('totalDetections').textContent = data.total_detections;
+                    el('nonCompliantCount').textContent = data.non_compliant_count;
+                    el('totalAlerts').textContent = data.total_alerts;
                     devMode = data.dev_mode;
-                    const indicator = document.getElementById('devModeIndicator');
-                    const btn = document.getElementById('devModeBtn');
-                    if (devMode) {
-                        indicator.style.display = 'inline-flex';
-                        if (btn) btn.classList.add('active');
-                    } else {
-                        indicator.style.display = 'none';
-                        if (btn) btn.classList.remove('active');
-                    }
                 })
                 .catch(error => console.error('Error fetching stats:', error));
         }
 
         document.addEventListener('DOMContentLoaded', function() {
+            selectSource('webcam');
             updateStats();
             setInterval(updateStats, 5000);
-            document.getElementById('statusIndicator').classList.add('inactive');
+            el('statusIndicator').classList.add('inactive');
         });
     </script>
 </body>

@@ -1,12 +1,17 @@
 # SafeSite - Real-Time PPE Compliance Monitoring
 
 [![tests](https://github.com/Sourav-Nath-01/SafeSite-PPE-Monitor/actions/workflows/tests.yml/badge.svg)](https://github.com/Sourav-Nath-01/SafeSite-PPE-Monitor/actions/workflows/tests.yml)
+[![deploy](https://github.com/Sourav-Nath-01/SafeSite-PPE-Monitor/actions/workflows/deploy.yml/badge.svg)](https://github.com/Sourav-Nath-01/SafeSite-PPE-Monitor/actions/workflows/deploy.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 
 Per-worker PPE compliance monitoring for construction sites: YOLOv8s detection,
 ByteTrack worker identity, geometric person-to-PPE association, and a violation
-audit trail with snapshots.
+audit trail with snapshots -- deployed on **Azure Container Apps** with
+infrastructure as code (Bicep) and passwordless CI/CD from GitHub Actions.
+
+**Live demo:** _add your Container App URL here after the first deploy_ -- try it
+with your webcam, a construction-site photo or a video file.
 
 ![Alt text](assets/videoconstruc2.gif)
 > 4,764 workers died on the job in 2020 (3.4 per 100,000 full-time equivalent workers). Workers in transportation and material moving occupations and construction and extraction occupations accounted for nearly half of all fatal occupational injuries (47.4 percent), representing 1,282 and 976 workplace deaths, respectively. 
@@ -269,28 +274,47 @@ compliance monitor with a reviewable violation log.
   - Greys out unassigned PPE, making the association decision visible in a demo
   - HUD with live FPS, per-frame inference time, headcount and violation count
 
-- **`app.py`** - Flask service
-  - `run_inference()`: `model.track(..., tracker='bytetrack.yaml', persist=True)`
-    so worker IDs are stable across frames
-  - Rolling 30-frame window for FPS and inference latency, streamed to the UI
-  - Per-violation snapshot rate limiting, so one worker cannot flood the queue
-  - Weight loading tries the 200-epoch checkpoint first and reports the fallback
-    loudly instead of silently serving a weaker model
-  - `SECRET_KEY` from `PPE_SECRET_KEY`, random per process otherwise
-  - Routes: `/`, `/video_feed`, `/start_stream`, `/stop_stream`, `/stats`,
-    `/settings`, `/api/settings`, `/review`, `/api/instances`,
-    `/api/instance/<id>/snapshots`, `/snapshots/<file>`
+- **`app.py`** - Flask + Socket.IO service. Three frame sources, one pipeline:
+
+  | Source | Transport | Where it works |
+  |---|---|---|
+  | Browser webcam / local video file | Socket.IO `client_frame` (WebSocket) | anywhere, including the cloud |
+  | Single image upload | `POST /api/detect` (stateless, nothing stored) | anywhere |
+  | Site camera, RTSP URL or server-side file | MJPEG `/video_feed` | on-prem (`PPE_VIDEO_SOURCE`) |
+
+  - `MonitorSession`: every video source gets its own model instance (ByteTrack
+    state lives on it), detector, debounce timers and snapshot rate limits, so
+    concurrent visitors never share worker IDs or alerts
+  - Backpressure: the browser sends its next frame only when the previous result
+    returns, so a slow server lowers the frame rate instead of building a queue
+  - Inference is serialised behind one lock; torch already uses every core
+  - Public-demo mode (`PPE_PUBLIC_DEMO`): visitors see only their own violations
+    (anonymous signed-cookie ID), settings are read-only, the site camera is off,
+    and snapshots are purged after `PPE_RETENTION_HOURS`
+  - Admin (`PPE_ADMIN_PASSWORD`, HTTP Basic over TLS) for settings and the
+    all-visitors review view (`/review?all=1`)
+  - Snapshots are served by bare file name through `send_from_directory`, never
+    by path; `/healthz` backs the container probes
+- **`settings_schema.py`** - defaults, validation and atomic persistence for the
+  settings the detection loop reads every frame (bad input is a 400, not a
+  crashed stream)
+- **`gunicorn.conf.py`** - one worker, threaded: session state is in-process
 
 - **`database.py`** - SQLite persistence
-  - Tables: `instances`, `snapshots`, `alerts`
-  - `_migrate()`: adds `instances.track_id` in place on existing databases, so
-    the review page can separate two workers logged in the same minute
+  - Tables: `instances`, `snapshots`, `alerts`; rows read by column name
+  - `_migrate()`: adds `track_id` and `owner` columns in place on existing databases
+  - Sort parameters are whitelisted (they are interpolated into `ORDER BY`)
+  - `purge_older_than()`: retention for the public demo
 
-- **`tests/`** - 40 unit tests, no model or GPU required
+- **`tests/`** - 72 unit tests, no model or GPU required
   - `test_ppe_association.py` (23): geometry, class mapping, region priors,
     adjacent-worker assignment, the helmet-on-the-ground regression
-  - `test_detection_logic.py` (17): debounce, per-track independence, track
-    eviction, instance-ID uniqueness, compliance modes
+  - `test_detection_logic.py` (24): debounce, per-track independence, track
+    eviction, instance-ID uniqueness across sessions, compliance modes,
+    single-image evaluation
+  - `test_database.py` (14): migration, sort whitelist, snapshot counts, visitor
+    isolation, retention
+  - `test_settings_schema.py` (11): validation and settings-file recovery
   - Time is injected by monkey-patching `time.time`, so the temporal tests are
     deterministic rather than sleep-based
 
@@ -329,8 +353,10 @@ Repository documentation assets:
 ### **Root Files**
 - **`requirements.txt`**: Runtime dependencies
 - **`requirements-long.txt`**: Install order, including the CUDA-matched PyTorch wheel
-- **`run_tests.sh`**: Runs the 40-test compliance suite (no model or GPU needed)
-- **`Dockerfile`** / **`.dockerignore`**: CPU container for the monitoring service
+- **`run_tests.sh`**: Runs the 72-test suite (no model or GPU needed)
+- **`Dockerfile`** / **`.dockerignore`**: CPU container (non-root, gunicorn, health check)
+- **`infra/`**: Bicep template and one-time bootstrap script for Azure
+- **`.github/workflows/`**: tests + Bicep compile on every push; deploy to Azure after tests pass
 - **`README.md`**: Project documentation and usage guide
 - **`LICENSE`**: Project licensing information
 
@@ -354,18 +380,28 @@ Construction-Site-Safety-PPE-Detection/
 │   ├── ppe_association.py     # person <-> PPE geometry (dependency-free)
 │   ├── detection_logic.py     # per-track debounce & violation state machine
 │   ├── visualization.py       # compliance overlay + HUD
-│   ├── app.py                 # Flask + SocketIO service
+│   ├── app.py                 # Flask + Socket.IO service
+│   ├── settings_schema.py     # settings validation & persistence
 │   ├── database.py            # SQLite persistence & migrations
+│   ├── gunicorn.conf.py       # production server config
 │   ├── templates/{index,review,settings}.html
 │   └── tests/
 │       ├── test_ppe_association.py
-│       └── test_detection_logic.py
+│       ├── test_detection_logic.py
+│       ├── test_database.py
+│       └── test_settings_schema.py
 │
 ├── Model-Testing/
 │   ├── evaluate.py            # held-out test-split metrics, per class
 │   ├── benchmark.py           # p50/p95/p99 latency & FPS per format
 │   ├── checker.py, test_cam.py, test_single.py
 │
+├── infra/
+│   ├── main.bicep             # Container Apps, ACR, Log Analytics, identities
+│   └── bootstrap.sh           # one-time setup, run in Azure Cloud Shell
+├── .github/workflows/
+│   ├── tests.yml              # unit tests + Bicep build
+│   └── deploy.yml             # build -> ACR -> Container Apps, via OIDC
 ├── Dockerfile
 ├── run_tests.sh
 ├── requirements.txt
@@ -473,21 +509,42 @@ pip install -r requirements.txt
 
 ```bash
 cd Model-Deployment
-export PPE_SECRET_KEY="$(python -c 'import os;print(os.urandom(24).hex())')"
-python app.py           # http://localhost:3333
+python app.py           # http://localhost:3333 (development server)
 ```
 
-The dashboard shows one card per tracked worker with their ID, the PPE they are
-wearing, what they are missing, and live FPS / per-frame latency. Violations are
-written to `detections.db` with an annotated snapshot and are browsable at
-`/review`.
+Pick a source on the dashboard: **Webcam** or **Video file** (streamed from the
+browser), **Image**, or **Site camera** (the server's own camera, see
+`PPE_VIDEO_SOURCE`). The dashboard shows one card per tracked worker with their
+ID, the PPE they are wearing, what they are missing, and live FPS / per-frame
+latency. Violations are written to `detections.db` with an annotated snapshot
+and are browsable at `/review`.
+
+### Configuration
+
+All optional; the defaults reproduce a local, single-user install.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PPE_PUBLIC_DEMO` | `false` | Per-visitor isolation, read-only settings, no site camera |
+| `PPE_ADMIN_PASSWORD` | _(unset)_ | Enables the `admin` login for settings and the all-visitors view |
+| `PPE_SECRET_KEY` | random per process | Signs the session cookie |
+| `PPE_DATA_DIR` | `Model-Deployment/` | Where the database, snapshots and settings live |
+| `PPE_VIDEO_SOURCE` | `0` | Site camera: webcam index, RTSP URL or video file (files loop) |
+| `PPE_SERVER_CAMERA` | `true` unless demo | Show the site-camera source |
+| `PPE_MAX_SESSIONS` | `4` | Concurrent browser video sessions |
+| `PPE_RETENTION_HOURS` | `0` (keep) | Purge violations older than this |
+| `PPE_MODEL_PATH` | 200-epoch `best.pt` | Override the weights |
+| `PPE_SECURE_COOKIES` | `false` | Set `true` behind HTTPS |
 
 ### Run in Docker
 
 ```bash
-docker build -t ppe-detection .
-docker run -p 3333:3333 -e PPE_SECRET_KEY=... ppe-detection
+docker build -t safesite .
+docker run -p 3333:3333 -e PPE_PUBLIC_DEMO=true safesite    # http://localhost:3333
 ```
+
+The image runs gunicorn as a non-root user and keeps its data in `/data`
+(mount a volume there to persist it).
 
 The image is CPU-only by default; for GPU inference swap the base image for
 `nvidia/cuda:12.4.1-runtime-ubuntu22.04`, install the CUDA torch wheel and run
@@ -499,9 +556,60 @@ with `--gpus all`.
 ./run_tests.sh
 ```
 
-40 tests covering association geometry and the temporal state machine. They
-import no torch, OpenCV or numpy and need no weights, so they run in
-milliseconds in CI.
+72 tests covering association geometry, the temporal state machine, the
+database layer and settings validation. They import no torch, OpenCV or numpy
+and need no weights, so they run in well under a second in CI.
+
+## Deploying to Azure
+
+```
+ GitHub push ─► tests (unit + Bicep build) ─► deploy workflow
+                                                │ OIDC login (no stored secret)
+                                                │ docker build ─► Azure Container Registry
+                                                ▼
+                         Azure Container Apps  (HTTPS ingress, WebSockets, scale 0-1)
+                         └─ container: gunicorn + Flask-SocketIO + YOLOv8s (CPU)
+                              │ pulls image with a managed identity (AcrPull)
+                              └─ logs ─► Log Analytics
+```
+
+Everything is defined in [`infra/main.bicep`](infra/main.bicep). Container Apps
+fits this workload: it supports WebSockets, terminates TLS (needed for browser
+camera access), and scales to zero, so an idle demo costs almost nothing.
+
+**One-time setup** (about 5 minutes; Azure Cloud Shell has every tool needed):
+
+```bash
+git clone https://github.com/<you>/<repo>.git && cd <repo>
+./infra/bootstrap.sh <you>/<repo>      # LOCATION=centralindia by default
+```
+
+This creates the resource group, container registry, Container Apps
+environment, Log Analytics workspace and two managed identities (one to pull
+images, one federated with GitHub for deploys), then sets the `AZURE_*`
+repository variables (or prints them for you to add).
+
+**Deploy:** push to `main`, or run `gh workflow run deploy.yml`. The workflow
+builds the image, pushes it, re-applies the Bicep template with the new tag,
+smoke-tests `/healthz` and puts the URL in the run summary.
+
+Optional repository settings: secret `PPE_ADMIN_PASSWORD`; variables
+`AZURE_MIN_REPLICAS` (`1` keeps the demo warm, no cold start) and `AZURE_CPU`
+(`0.5`-`2.0`).
+
+**Cost (rough estimate - check the Azure pricing calculator for your region):**
+with `minReplicas=0` the app mostly falls inside the Container Apps monthly free
+grant, leaving the Basic registry (about US$5/month) as the main cost. Keeping
+one replica warm (`AZURE_MIN_REPLICAS=1`, 1 vCPU / 2 GiB) adds idle-rate compute,
+on the order of US$20-25/month. `az group delete -n rg-safesite` removes
+everything.
+
+**Operations:**
+
+```bash
+az containerapp logs show -g rg-safesite -n ca-safesite --follow   # live logs
+az containerapp revision list -g rg-safesite -n ca-safesite -o table
+```
 
 ### Evaluate and benchmark
 
@@ -553,8 +661,17 @@ Stated plainly, because they bound what the system can honestly claim:
 - **Dataset domain.** Roboflow CSS imagery skews toward daylight and clear
   weather; night, rain, and high-visibility-clothing variation are
   under-represented.
-- **Single camera, single process.** Multi-camera scaling would need the
-  inference loop moved off the Flask worker onto a queue.
+- **Single replica.** Socket.IO sessions and tracker state live in process
+  memory, so the deployment is pinned to one replica (a few concurrent visitors
+  on CPU). Scaling out would need sticky sessions plus a message queue, or
+  inference moved to a separate worker pool.
+- **Ephemeral storage in the cloud.** The SQLite log and snapshots live in the
+  container's filesystem; a restart or scale-to-zero clears them. That suits a
+  public demo (and its privacy); a production deployment would move to Azure
+  Database for PostgreSQL and Blob Storage.
+- **CPU inference.** Roughly 300 ms per frame for YOLOv8s on one vCPU, i.e. a
+  few FPS per visitor. An ONNX Runtime image or a GPU workload profile would
+  raise it.
 
 ## Future Enhancements
 
@@ -567,7 +684,7 @@ Stated plainly, because they bound what the system can honestly claim:
 4. **Model comparison**: YOLOv8n / v8m / v11 under identical settings, as an
    accuracy-vs-latency curve rather than a single point
 5. **Multi-camera support**: Move inference onto a worker queue so one process
-   can serve several feeds
+   can serve several feeds and the web tier can scale past one replica
 6. **Edge deployment**: Jetson / Raspberry Pi with the quantized export
 7. **Alert integrations**: Email, SMS or webhook fan-out on confirmed violations
 
@@ -581,5 +698,7 @@ by Roboflow.
 
 Work added in this fork: the person-to-PPE association module, ByteTrack
 integration and per-track temporal state machine, the compliance visualization
-layer, the 40-test suite, the test-split evaluation and latency benchmarking
-scripts, the SQLite migration, and containerization.
+layer, browser-fed video and image inference with per-visitor sessions, the
+72-test suite, the test-split evaluation and latency benchmarking scripts, the
+SQLite migrations, containerization, and the Azure deployment (Bicep + GitHub
+Actions).

@@ -79,7 +79,9 @@ jobs:
             --name "deploy-${GITHUB_RUN_ID}" \
             --template-file infra/main.bicep \
             --parameters name="$NAME" imageTag="$TAG" assignRoles=false \
-                         githubRepo="$GITHUB_REPOSITORY" minReplicas="$MIN_REPLICAS" cpu="$CPU" \
+                         githubRepo="$GITHUB_REPOSITORY" \
+                         githubOwnerId="$GITHUB_REPOSITORY_OWNER_ID" githubRepoId="$GITHUB_REPOSITORY_ID" \
+                         minReplicas="$MIN_REPLICAS" cpu="$CPU" \
                          adminPassword="$ADMIN_PASSWORD" \
             --query properties.outputs.appUrl.value --output tsv)
           echo "url=$url" >> "$GITHUB_OUTPUT"

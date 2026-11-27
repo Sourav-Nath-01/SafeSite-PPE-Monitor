@@ -39,12 +39,20 @@ done
 echo "==> Resource group ${RESOURCE_GROUP} (${LOCATION})"
 az group create --name "$RESOURCE_GROUP" --location "$LOCATION" --output none
 
+# GitHub may sign OIDC tokens with immutable numeric IDs in the subject
+# (repo:owner@123/name@456:...); the template trusts that form too.
+echo "==> Looking up GitHub IDs for ${REPO}"
+IDS=$(curl -fsSL "https://api.github.com/repos/${REPO}" \
+  | python3 -c "import json, sys; r = json.load(sys.stdin); print(r['owner']['id'], r['id'])")
+read -r OWNER_ID REPO_ID <<<"$IDS"
+
 echo "==> Registry, environment and identities"
 az deployment group create \
   --resource-group "$RESOURCE_GROUP" \
   --name "$DEPLOYMENT" \
   --template-file infra/main.bicep \
   --parameters name="$NAME" deployApp=false githubRepo="$REPO" \
+               githubOwnerId="$OWNER_ID" githubRepoId="$REPO_ID" \
   --output none
 
 output() {
